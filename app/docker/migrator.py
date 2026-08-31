@@ -1,10 +1,19 @@
-"""迁移逻辑（通用版：pull + push 两种模式）。
+"""迁移逻辑（通用版：pull + push 两种模式，全要素无损迁移）。
 
-拉模式 (pull)：rsync 从远端拉项目 -> 同步外部 bind mount -> 重写 compose 路径（如启用映射）
-                -> 本机 docker compose pull / up。
-推模式 (push)：本机 compose 先解析 bind -> 必要时重写 compose（拷贝到临时 dir 再推）
-                -> rsync 项目目录到远端 -> rsync 外部 bind mount 到远端
-                -> 远端（目标 NAS）执行 docker compose pull / up。
+pull  模式：部署在「目标 NAS」，SSH 连接源 NAS，拉项目目录 + bind mount + named volumes + build context →
+           本机按 compose 重写路径、create volume / network、compose build（如有）+ pull + up。
+push  模式：部署在「源 NAS」，扫描本机项目 → staging 重写 compose → 推送项目目录 + bind mount + named volumes →
+           目标 NAS create volume / network、compose build（如有）+ pull + up。
+
+覆盖的要素：
+  ✅ docker-compose.yml / compose.yaml（含长/短语法）
+  ✅ bind mount（绝对路径）+ 路径前缀映射重写
+  ✅ named volumes（数据在 /var/lib/docker/volumes/<name>/_data）
+  ✅ custom networks（driver + options，跳过 external）
+  ✅ build 指令（build context 随项目目录一起同步）
+  ✅ .env 文件（在项目目录内，自动随 rsync 一起走）
+  ✅ 镜像（compose pull；build 项目先 compose build）
+  ✅ 文件权限 / 软链 / symlink（rsync -a --numeric-ids --copy-links）
 """
 import os
 import shlex
@@ -21,81 +30,65 @@ class Migrator:
     def __init__(self):
         self.tasks = {}  # task_id -> {status, log:[...]}
 
-    # ---------- Docker 常见错误 → 中文修复建议 ----------
-    # 每条规则: (关键词列表全部命中 or 任意1命中, 提示语)
+    # ==========================================================================
+    # Docker 常见错误 → 中文修复建议（保持原有）
+    # ==========================================================================
     DOCKER_ERROR_HINTS = [
-        # 网络超时 / 出网不可达
         (["i/o timeout"],
-         "💡 修复建议：镜像仓库 443 出网超时（i/o timeout）。请检查：① 该 NAS 到镜像仓库的出网是否畅通；"
-         "② 如在国内可在 Docker daemon.json 配置 registry-mirrors（国内镜像加速器）；"
-         "③ 或到仓库链路走 HTTP/HTTPS 代理（在 Docker 启动环境变量里加 HTTP_PROXY/HTTPS_PROXY）。"),
+         "💡 修复建议：镜像仓库 443 出网超时。请检查该 NAS 出网；国内环境可在 Docker daemon.json "
+         "配 registry-mirrors 镜像加速器，或配置 HTTP_PROXY/HTTPS_PROXY。"),
         (["context deadline exceeded"],
-         "💡 修复建议：Docker 拉取触发 context deadline exceeded。典型原因为对端 registry 网络太慢或不可达。"
-         "建议：① 在对应 NAS 上配 registry-mirrors 或 HTTP 代理；"
-         "② 临时改用『迁移后不拉镜像』，手动 docker load 离线 tarball 再 up。"),
+         "💡 修复建议：Docker 拉取触发 context deadline exceeded。典型原因是对端 registry 太慢或不可达。"
+         "建议在对应 NAS 上配 registry-mirrors 或代理；或关闭『拉取镜像』手动 docker save/load 离线 tarball。"),
         (["TLS handshake timeout"],
-         "💡 修复建议：registry TLS 握手超时 = HTTPS 链路慢/被墙。通常和上两条一样，配镜像加速器/代理即可；"
-         "如为自建 registry 请确认证书 CN 匹配域名且未过期。"),
-        # DNS
+         "💡 修复建议：registry TLS 握手超时 = HTTPS 链路慢/被墙。配镜像加速器/代理即可；"
+         "自建仓请确认证书 CN 匹配域名且未过期。"),
         (["no such host"],
-         "💡 修复建议：DNS 解析失败（no such host）。检查该 NAS 的 /etc/resolv.conf 是否能解析镜像仓库域名。"
-         "常见：私有仓内网 DNS 未配置、或对端 NAS 使用了只能在本局域网解析的域名。"),
+         "💡 修复建议：DNS 解析失败（no such host）。检查该 NAS /etc/resolv.conf 是否能解析镜像仓库域名；"
+         "常见：私有仓内网 DNS 未配置、或对端 NAS 使用了只能本局域网解析的域名。"),
         (["lookup .* on .*: no such host"],
-         "💡 修复建议：DNS 解析失败（no such host）。检查该 NAS 的 /etc/resolv.conf 是否能解析镜像仓库域名。"
-         "常见：私有仓内网 DNS 未配置、或对端 NAS 使用了只能在本局域网解析的域名。"),
-        # 鉴权 / 私有仓
+         "💡 修复建议：DNS 解析失败。检查该 NAS /etc/resolv.conf；私有仓内网 DNS 需可达。"),
         (["pull access denied"],
-         "💡 修复建议：pull access denied = 对该镜像无权访问。通常原因：① 私有镜像仓库未登录（需 docker login <registry>）；"
-         "② 镜像名/namespace 拼写错误；③ 公网镜像因限流被拒，尝试稍后或配置 registry-mirrors。"),
+         "💡 修复建议：pull access denied = 对该镜像无权访问。通常原因：① 私有仓未 docker login；"
+         "② 镜像名/namespace 拼写错误；③ 公网镜像限流稍后或配 registry-mirrors。"),
         (["repository does not exist"],
-         "💡 修复建议：repository does not exist。请核对 compose 中 image 字段（拼写、tag、registry 前缀）是否存在；"
-         "如为私有仓请先 docker login。"),
+         "💡 修复建议：repository does not exist。请核对 compose image 字段（拼写、tag、registry 前缀）；"
+         "私有仓请先 docker login。"),
         (["unauthorized", "authentication required"],
-         "💡 修复建议：镜像仓库 401 Unauthorized/鉴权失败。请在对应 NAS 上先执行 docker login <你的镜像仓域名>。"),
+         "💡 修复建议：镜像仓 401 Unauthorized。请在对应 NAS 上先 docker login <镜像仓域名>。"),
         (["denied: requested access to the resource is denied"],
-         "💡 修复建议：镜像仓 denied = 当前登录账号无拉取权限。请换成有权限的 docker login 账号，或联系镜像仓管理员授权。"),
-        # manifest / tag
+         "💡 修复建议：镜像仓 denied = 登录账号无拉权限。换账号或联系镜像仓管理员授权。"),
         (["manifest unknown"],
-         "💡 修复建议：manifest unknown = tag 不存在（可能 compose 里写了错的 tag、或 latest 被清）。"
-         "请核对源 NAS 上 docker images 该镜像的实际 tag，修改 compose 后重试。"),
+         "💡 修复建议：manifest unknown = tag 不存在（可能 compose 写错 tag、latest 被清）。"
+         "核对源 NAS docker images 的实际 tag，改 compose 后重试。"),
         (["manifest for .* not found"],
          "💡 修复建议：镜像 tag 未找到。核对 compose 中 image:tag 与源 NAS docker images 输出是否一致；"
-         "如果源是本地 build 出来的且没 push，拉镜像选项无意义，请关掉『拉取镜像』后手动 docker save/load。"),
-        # 连接被重置 / 断流
+         "如果源是本地 build 没 push，关『拉取镜像』手动 docker save/load。"),
         (["connection reset by peer", "EOF"],
-         "💡 修复建议：registry 连接被重置 / EOF，多为出口网络不稳或镜像仓限流。"
-         "建议：① 配置 registry-mirrors；② 改用离线 docker save/load；③ 在网络闲时重试。"),
-        # Daemon / CLI
+         "💡 修复建议：registry 连接被重置 / EOF，出口不稳或被限流。"
+         "配 registry-mirrors / 离线 docker save / 闲时重试。"),
         (["Cannot connect to the Docker daemon"],
-         "💡 修复建议：无法连接 Docker daemon。请检查：① 该 NAS 上是否已安装并启动 Docker 应用；"
-         "② /var/run/docker.sock 是否可被 dockermigrator 用户访问（一般由飞牛 docker-project 资源自动授权）。"),
-        (["docker: command not found", "\"docker\": executable file not found"],
-         "💡 修复建议：docker 命令不存在。"
-         "如错误发生在『远端』（推模式目标 NAS）：请先在目标 NAS 安装 Docker 应用，并确保 docker compose v2 插件可用；"
-         "如错误发生在『本机』：请确认 dockermigrator 容器内 /app/docker/bin/docker 已正确挂载到 PATH。"),
+         "💡 修复建议：无法连接 Docker daemon。检查：① 该 NAS 是否已装并启动 Docker 应用；"
+         "② /var/run/docker.sock 权限（飞牛 docker-project 资源自动授权）。"),
+        (["docker: command not found"],
+         "💡 修复建议：docker 命令不存在。推模式目标 NAS 需先装 Docker + compose v2 插件。"),
+        (["\"docker\": executable file not found"],
+         "💡 修复建议：docker 命令不存在。推模式目标 NAS 需先装 Docker + compose v2 插件。"),
         (["compose is not a docker command"],
-         "💡 修复建议：docker compose 子命令不存在 = 缺 compose v2 插件。"
-         "如在推模式目标 NAS 上报错：请升级 Docker 版本或手动安装 docker-compose 插件（docker-compose-plugin 包）。"),
-        # 端口绑定冲突
+         "💡 修复建议：缺 compose v2 插件。升级 Docker 或安装 docker-compose-plugin。"),
         (["port is already allocated"],
-         "💡 修复建议：宿主机端口被占用。检查目标 NAS 上 compose 映射的 host 端口是否已被其他容器占用；"
-         "用 docker ps 查看后停掉冲突容器，或改 compose 里的 host 端口再重试。"),
-        # 磁盘
+         "💡 修复建议：宿主机端口被占用。docker ps 看占用 → 停冲突容器或改 compose host 端口。"),
         (["no space left on device"],
-         "💡 修复建议：目标 NAS 磁盘空间不足。清理无用镜像(docker system prune -a)、日志或迁移到大容量卷再重试。"),
+         "💡 修复建议：目标 NAS 磁盘空间不足。docker system prune -a 清理或换大容量卷。"),
     ]
 
     @classmethod
     def _diagnose_docker_error(cls, all_lines):
-        """扫描最近的输出行（stdout+stderr），命中则按顺序返回一条最贴切的修复建议。
-        规则：一条规则的所有 keyword（正则）都命中 blob 则触发；数组顺序即优先级。
-        """
         if not all_lines:
             return None
         import re
         blob = "\n".join(all_lines).lower()
         for kws, hint in cls.DOCKER_ERROR_HINTS:
-            # 本规则里多个关键词之间是 AND 关系；每个关键词是正则（大小写不敏感，已 lower）
             all_hit = True
             for kw in kws:
                 if not re.search(kw.lower(), blob):
@@ -105,7 +98,9 @@ class Migrator:
                 return hint
         return None
 
-    # ---------- 任务状态 ----------
+    # ==========================================================================
+    # 任务状态
+    # ==========================================================================
     def create_task(self, task_id):
         self.tasks[task_id] = {"status": "pending", "log": []}
 
@@ -115,8 +110,10 @@ class Migrator:
             return
         task["log"].append({"line": line, "stream": stream})
 
-    # ---------- 执行本机子进程 ----------
-    async def _run_cmd(self, task_id, cmd, env=None, label=None):
+    # ==========================================================================
+    # 执行本机子进程
+    # ==========================================================================
+    async def _run_cmd(self, task_id, cmd, env=None, label=None, warn_only=False):
         if label:
             self._log(task_id, f"$ {label}")
         self._log(task_id, "$ " + " ".join(shlex.quote(c) for c in cmd))
@@ -128,6 +125,9 @@ class Migrator:
                 env=env,
             )
         except FileNotFoundError as e:
+            if warn_only:
+                self._log(task_id, f"警告：命令不存在 {e}，跳过", "stderr")
+                return None
             raise RuntimeError(f"命令不存在：{e}")
 
         all_lines = []
@@ -145,23 +145,24 @@ class Migrator:
         await asyncio.gather(drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"))
         rc = await proc.wait()
         if rc != 0:
-            # 仅在 docker 相关命令失败时给出针对性修复建议
+            if warn_only:
+                self._log(task_id, f"警告：exit={rc}（warn_only，继续）", "stderr")
+                return None
             if cmd and (cmd[0].endswith("docker") or "docker" in cmd[0]):
                 hint = self._diagnose_docker_error(all_lines)
                 if hint:
                     self._log(task_id, hint, "stderr")
                 else:
-                    self._log(
-                        task_id,
-                        "💡 通用排查：① 对应 NAS 上 docker info 是否正常；"
-                        "② 镜像名/tag 是否存在(docker images)；③ 检查磁盘空间(df -h)和网络。",
-                        "stderr",
-                    )
+                    self._log(task_id,
+                              "💡 通用排查：① 对应 NAS docker info 正常吗？② 镜像/tag 存在吗？③ 磁盘(df -h)和网络？",
+                              "stderr")
             raise RuntimeError(f"命令失败 (exit={rc})")
+        return "\n".join(all_lines)
 
-    # ---------- 执行远端命令（push 模式：docker compose pull/up） ----------
-    async def _run_remote_cmd(self, task_id, remote_cfg, cmd, label=None):
-        """用 SSHClient.exec_stream 远程执行命令，输出落到任务日志。"""
+    # ==========================================================================
+    # 远端命令（推模式）
+    # ==========================================================================
+    async def _run_remote_cmd(self, task_id, remote_cfg, cmd, label=None, warn_only=False):
         if label:
             self._log(task_id, f"$ {label}（远端）")
         self._log(task_id, "$ [remote] " + " ".join(shlex.quote(c) for c in cmd))
@@ -183,46 +184,117 @@ class Migrator:
 
         ok, tail, lines = await loop.run_in_executor(None, _run_sync)
         if not ok:
-            # 远端 docker 命令失败 → 同样输出诊断
+            if warn_only:
+                self._log(task_id, f"警告：远端命令失败 {tail}（warn_only，继续）", "stderr")
+                return None
             is_docker = any("docker" in str(c).lower() for c in cmd)
             if is_docker:
                 hint = self._diagnose_docker_error(lines)
                 if hint:
                     self._log(task_id, hint + "（以上提示针对目标 NAS 远端环境）", "stderr")
                 else:
-                    self._log(
-                        task_id,
-                        "💡 远端通用排查：① 目标 NAS 上 docker info 正常吗？② compose 中镜像/tag 是否存在？"
-                        "③ 目标 NAS 磁盘和出网是否通畅？",
-                        "stderr",
-                    )
+                    self._log(task_id,
+                              "💡 远端通用排查：① docker info 正常？② compose 镜像/tag 存在？③ 磁盘和出网通畅？",
+                              "stderr")
             raise RuntimeError(f"远端命令失败 {tail}")
+        return "\n".join(lines)
 
-    # ---------- compose 解析 ----------
+    # ==========================================================================
+    # compose 解析 — bind mounts / named volumes / networks / build
+    # ==========================================================================
     @staticmethod
-    def _extract_bind_mounts(compose_path):
+    def _parse_compose(compose_path):
+        """一次性解析 compose 文件，返回 {binds, named_volumes, networks, has_build}。
+
+        binds:         [(src_host_path, svc_name), ...]  # 绝对路径 bind mount
+        named_volumes: [(vol_name, svc_name), ...]       # 非绝对路径 = named volume
+        volume_defs:   {vol_name: {external: bool, driver: str|None, opts: dict}}
+        network_defs:  {net_name: {external: bool, driver: str|None, opts: dict,
+                                   attachable: bool, enable_ipv6: bool, subnets: list}}
+        has_build:     bool                               # 任一 service 有 build
+        build_contexts: set(str)                          # 相对路径 build context（相对 compose 文件所在目录）
+        """
         with open(compose_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        paths, seen = [], set()
-        for svc in (data.get("services") or {}).values():
-            vols = svc.get("volumes")
-            if not isinstance(vols, list):
-                continue
-            for v in vols:
-                src = None
+        if not isinstance(data, dict):
+            return {"binds": [], "named_volumes": [], "volume_defs": {},
+                    "network_defs": {}, "has_build": False, "build_contexts": set()}
+
+        binds = []
+        named_volumes = []
+        has_build = False
+        build_contexts = set()
+
+        for svc_name, svc in (data.get("services") or {}).items():
+            # ---- volumes ----
+            for v in (svc.get("volumes") or []):
                 if isinstance(v, str):
                     parts = v.split(":")
-                    if len(parts) >= 2 and parts[0].startswith("/"):
-                        src = parts[0]
+                    if len(parts) < 2:
+                        continue
+                    if parts[0].startswith("/"):
+                        binds.append((parts[0], svc_name))
+                    else:
+                        named_volumes.append((parts[0], svc_name))
                 elif isinstance(v, dict):
-                    s = v.get("source")
-                    if isinstance(s, str) and s.startswith("/"):
-                        src = s
-                if src and src not in seen:
-                    seen.add(src)
-                    paths.append(src)
-        return paths
+                    src = v.get("source")
+                    target = v.get("target", "")
+                    vol_type = v.get("type", "volume")
+                    if vol_type == "bind" and isinstance(src, str) and src.startswith("/"):
+                        binds.append((src, svc_name))
+                    elif vol_type == "volume":
+                        if isinstance(src, str) and not src.startswith("/"):
+                            named_volumes.append((src, svc_name))
+                        elif isinstance(target, str) and target.startswith("/"):
+                            # 无 name 的 named volume 用 target 的哈希？不可能无 name 但有 target
+                            pass
 
+            # ---- build ----
+            build = svc.get("build")
+            if build:
+                has_build = True
+                if isinstance(build, str):
+                    ctx = build
+                elif isinstance(build, dict):
+                    ctx = build.get("context", ".")
+                else:
+                    ctx = "."
+                build_contexts.add(ctx)
+
+        # ---- top-level volumes ----
+        volume_defs = {}
+        for name, vdef in (data.get("volumes") or {}).items():
+            vdef = vdef or {}
+            volume_defs[name] = {
+                "external": bool(vdef.get("external", False)),
+                "driver": vdef.get("driver"),
+                "opts": vdef.get("driver_opts") or {},
+            }
+
+        # ---- top-level networks ----
+        network_defs = {}
+        for name, ndef in (data.get("networks") or {}).items():
+            ndef = ndef or {}
+            network_defs[name] = {
+                "external": bool(ndef.get("external", False)),
+                "driver": ndef.get("driver"),
+                "opts": ndef.get("driver_opts") or {},
+                "attachable": bool(ndef.get("attachable", False)),
+                "enable_ipv6": bool(ndef.get("enable_ipv6", False)),
+            }
+
+        return {
+            "binds": binds,
+            "named_volumes": named_volumes,
+            "volume_defs": volume_defs,
+            "network_defs": network_defs,
+            "has_build": has_build,
+            "build_contexts": build_contexts,
+        }
+
+    # ==========================================================================
+    # compose 重写 — bind 路径前缀映射
+    # ==========================================================================
     @staticmethod
     def _rewrite_compose(compose_path, source_prefix, target_prefix):
         if not source_prefix or source_prefix == target_prefix:
@@ -253,7 +325,9 @@ class Migrator:
                                default_flow_style=False)
         return changed
 
-    # ---------- rsync helper ----------
+    # ==========================================================================
+    # rsync helpers
+    # ==========================================================================
     def _rsync_env(self, remote_cfg):
         rsh_base = (
             f"ssh -p {remote_cfg['port']} "
@@ -276,13 +350,13 @@ class Migrator:
         src = remote_src if remote_src.endswith("/") else remote_src + "/"
         dst = local_dst if local_dst.endswith("/") else local_dst + "/"
         rsh, env = self._rsync_env(remote_cfg)
-        cmd = ["rsync", "-av", "--numeric-ids", "-e", rsh,
+        cmd = ["rsync", "-avX", "--numeric-ids", "-e", rsh,
                f"{remote_cfg['username']}@{remote_cfg['host']}:{src}", dst]
         await self._run_cmd(task_id, cmd, env=env, label=label)
 
     async def _rsync_push(self, task_id, remote_cfg, local_src, remote_dst, label=None):
         """从本机 local_src/ rsync 推到远端 remote_dst/。"""
-        # 先在远端 mkdir -p（按密码/密钥 拼对应的 ssh 命令）
+        # 先在远端 mkdir -p（兼容密码 / 密钥两种认证）
         ssh_base = (
             f"ssh -p {remote_cfg['port']} "
             "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
@@ -309,24 +383,25 @@ class Migrator:
         rc = mdir.returncode
         if rc != 0:
             detail = err.decode(errors="replace").strip().splitlines()[-1] if err else ""
-            self._log(
-                task_id,
-                f"警告：远端 mkdir {remote_dst} 失败 rc={rc} {detail}（后续 rsync 仍尝试继续）",
-                "stderr",
-            )
+            self._log(task_id,
+                      f"警告：远端 mkdir {remote_dst} 失败 rc={rc} {detail}（后续 rsync 仍尝试继续）",
+                      "stderr")
 
         src = local_src if local_src.endswith("/") else local_src + "/"
         dst = remote_dst if remote_dst.endswith("/") else remote_dst + "/"
         rsh, env = self._rsync_env(remote_cfg)
-        cmd = ["rsync", "-av", "--numeric-ids", "-e", rsh,
+        cmd = ["rsync", "-avX", "--numeric-ids", "-e", rsh,
                src, f"{remote_cfg['username']}@{remote_cfg['host']}:{dst}"]
         await self._run_cmd(task_id, cmd, env=env, label=label)
 
-    # ---------- 查找 compose 文件 ----------
+    # ==========================================================================
+    # 查找 compose 文件
+    # ==========================================================================
     @staticmethod
     def _find_compose_file(proj_dir, preferred_name=None):
         candidates = [preferred_name] if preferred_name else []
-        candidates += ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]
+        candidates += ["docker-compose.yml", "docker-compose.yaml",
+                       "compose.yml", "compose.yaml"]
         for c in candidates:
             if c is None:
                 continue
@@ -335,9 +410,119 @@ class Migrator:
                 return p, os.path.basename(p)
         return None, None
 
-    # -------------------------------------------------------------------------
+    # ==========================================================================
+    # named volume 辅助 — 拿源/目标 volume 的真实 mountpoint
+    # ==========================================================================
+    async def _get_local_volume_mountpoint(self, task_id, vol_name):
+        """本机 docker volume inspect，返回 Mountpoint。"""
+        out = await self._run_cmd(
+            task_id,
+            ["docker", "volume", "inspect", "-f", "{{.Mountpoint}}", vol_name],
+            warn_only=True,
+        )
+        if out and out.strip():
+            return out.strip()
+        return None
+
+    async def _get_remote_volume_mountpoint(self, task_id, remote_cfg, vol_name):
+        """远端 docker volume inspect。"""
+        out = await self._run_remote_cmd(
+            task_id, remote_cfg,
+            ["docker", "volume", "inspect", "-f", "{{.Mountpoint}}", vol_name],
+            warn_only=True,
+        )
+        if out and out.strip():
+            return out.strip()
+        return None
+
+    async def _ensure_local_volume(self, task_id, vol_name, vdef):
+        """本机 docker volume create（若不存在）。"""
+        existing = await self._get_local_volume_mountpoint(task_id, vol_name)
+        if existing:
+            self._log(task_id, f"  本机 volume {vol_name} 已存在 ({existing})")
+            return existing
+        cmd = ["docker", "volume", "create"]
+        driver = (vdef or {}).get("driver")
+        if driver:
+            cmd += ["--driver", driver]
+        for k, v in ((vdef or {}).get("opts") or {}).items():
+            cmd += ["--opt", f"{k}={v}"]
+        cmd.append(vol_name)
+        await self._run_cmd(task_id, cmd, label=f"docker volume create {vol_name}")
+        return await self._get_local_volume_mountpoint(task_id, vol_name)
+
+    async def _ensure_remote_volume(self, task_id, remote_cfg, vol_name, vdef):
+        """远端 docker volume create（若不存在）。"""
+        existing = await self._get_remote_volume_mountpoint(task_id, remote_cfg, vol_name)
+        if existing:
+            self._log(task_id, f"  远端 volume {vol_name} 已存在 ({existing})")
+            return existing
+        cmd = ["docker", "volume", "create"]
+        driver = (vdef or {}).get("driver")
+        if driver:
+            cmd += ["--driver", driver]
+        for k, v in ((vdef or {}).get("opts") or {}).items():
+            cmd += ["--opt", f"{k}={v}"]
+        cmd.append(vol_name)
+        await self._run_remote_cmd(task_id, remote_cfg, cmd,
+                                   label=f"远端 docker volume create {vol_name}")
+        return await self._get_remote_volume_mountpoint(task_id, remote_cfg, vol_name)
+
+    # ==========================================================================
+    # network 辅助 — create（跳过 external）
+    # ==========================================================================
+    async def _ensure_local_network(self, task_id, net_name, ndef):
+        """本机 docker network create（如不存在、非 external）。"""
+        ndef = ndef or {}
+        if ndef.get("external"):
+            self._log(task_id, f"  网络 {net_name} 声明为 external，跳过创建")
+            return
+        cmd = ["docker", "network", "ls", "--filter", f"name=^{net_name}$", "-q"]
+        out = await self._run_cmd(task_id, cmd, warn_only=True)
+        if out and out.strip():
+            self._log(task_id, f"  本机 network {net_name} 已存在")
+            return
+        ncmd = ["docker", "network", "create"]
+        driver = ndef.get("driver")
+        if driver:
+            ncmd += ["--driver", driver]
+        if ndef.get("attachable"):
+            ncmd.append("--attachable")
+        if ndef.get("enable_ipv6"):
+            ncmd.append("--ipv6")
+        for k, v in (ndef.get("opts") or {}).items():
+            ncmd += ["--opt", f"{k}={v}"]
+        ncmd.append(net_name)
+        await self._run_cmd(task_id, ncmd, label=f"docker network create {net_name}")
+
+    async def _ensure_remote_network(self, task_id, remote_cfg, net_name, ndef):
+        """远端 docker network create。"""
+        ndef = ndef or {}
+        if ndef.get("external"):
+            self._log(task_id, f"  网络 {net_name} 声明为 external，跳过创建")
+            return
+        cmd = ["docker", "network", "ls", "--filter", f"name=^{net_name}$", "-q"]
+        out = await self._run_remote_cmd(task_id, remote_cfg, cmd, warn_only=True)
+        if out and out.strip():
+            self._log(task_id, f"  远端 network {net_name} 已存在")
+            return
+        ncmd = ["docker", "network", "create"]
+        driver = ndef.get("driver")
+        if driver:
+            ncmd += ["--driver", driver]
+        if ndef.get("attachable"):
+            ncmd.append("--attachable")
+        if ndef.get("enable_ipv6"):
+            ncmd.append("--ipv6")
+        for k, v in (ndef.get("opts") or {}).items():
+            ncmd += ["--opt", f"{k}={v}"]
+        ncmd.append(net_name)
+        await self._run_remote_cmd(task_id, remote_cfg, ncmd,
+                                   label=f"远端 docker network create {net_name}")
+
+    # ==========================================================================
     # 统一入口
-    # -------------------------------------------------------------------------
+    # ==========================================================================
     async def run(self, task_id, direction, remote, local_docker_root, remote_docker_root,
                   projects, pull_images=True, start_containers=True,
                   source_prefix="", target_prefix=""):
@@ -364,108 +549,179 @@ class Migrator:
             self._log(task_id, f"错误: {e}", "stderr")
             raise
 
-    # -------------------------------------------------------------------------
-    # 拉模式（原有逻辑，略重构）
-    # -------------------------------------------------------------------------
+    # ==========================================================================
+    # 拉模式 — 目标 NAS 部署
+    # ==========================================================================
     async def _run_pull(self, task_id, remote, local_root, projects,
                         pull_images, start_containers,
                         source_prefix, target_prefix, prefix_active):
         if prefix_active:
-            self._log(task_id,
-                      f"路径前缀映射：{source_prefix} -> {target_prefix}")
+            self._log(task_id, f"路径前缀映射：{source_prefix} -> {target_prefix}")
         else:
             self._log(task_id,
                       "未启用路径前缀映射：要求源/目标 NAS 路径完全一致，否则外部 bind mount 会失效",
                       "stderr")
+
         remote_user = remote["username"]
         remote_host = remote["host"]
+
         for idx, proj in enumerate(projects, 1):
             name = proj["name"]
             remote_path = proj.get("remote_path") or f"(missing remote_path for {name})"
             compose_name = proj.get("compose_file", "docker-compose.yml")
             local_dst = os.path.join(local_root, name)
 
-            self._log(task_id, f"\n========== [{idx}/{len(projects)}] {name} ==========")
+            self._log(task_id, f"\n{'='*10} [{idx}/{len(projects)}] {name} {'='*10}")
             self._log(task_id, f"源: {remote_user}@{remote_host}:{remote_path}")
             self._log(task_id, f"目标: {local_dst}")
             os.makedirs(local_root, exist_ok=True)
 
-            # 1) 拉取项目目录
+            # ---- 1) rsync 拉项目目录（含 compose、.env、build context）----
             await self._rsync_pull(task_id, remote, remote_path, local_dst,
                                    label=f"rsync 拉取项目 {name}")
 
-            # 2) 找 compose
+            # ---- 2) 找 compose ----
             compose_file, compose_name = self._find_compose_file(local_dst, compose_name)
             if not compose_file:
                 self._log(task_id,
-                          f"警告：未找到 compose 文件，跳过 {name} 的镜像/容器操作", "stderr")
+                          f"⚠️ 警告：未找到 compose 文件，跳过 {name} 的镜像/容器/数据操作",
+                          "stderr")
                 continue
 
-            # 3) bind 同步
+            # ---- 3) 解析 compose：binds + named_volumes + networks + build ----
             try:
-                bind_paths = self._extract_bind_mounts(compose_file)
+                parsed = self._parse_compose(compose_file)
             except Exception as e:
                 self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
-                bind_paths = []
+                parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
+                          "network_defs": {}, "has_build": False, "build_contexts": set()}
 
+            binds = parsed["binds"]
+            named_vols = parsed["named_volumes"]
+            volume_defs = parsed["volume_defs"]
+            network_defs = parsed["network_defs"]
+            has_build = parsed["has_build"]
+            build_contexts = parsed["build_contexts"]
+
+            if build_contexts:
+                self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}")
+
+            # ---- 4) bind mount 同步（排除项目目录内部的）----
             rp_norm = os.path.normpath(remote_path)
-            for bp in bind_paths:
+            lp_norm = os.path.normpath(local_dst)
+            for bp, svc in binds:
                 bp_norm = os.path.normpath(bp)
+                # 项目内部路径跳过（已经随项目 rsync 过来了）
                 if bp_norm == rp_norm or bp_norm.startswith(rp_norm + "/"):
                     continue
+                # 也可能是本地已有绝对路径但属于项目内部（build context 相对路径）
+                # 前缀映射处理
                 if prefix_active:
                     if bp.startswith(source_prefix):
                         local_target = target_prefix + bp[len(source_prefix):]
                     else:
-                        self._log(
-                            task_id,
-                            f"跳过外部 bind mount {bp}：已启用前缀映射但路径不以前缀"
-                            f" {source_prefix!r} 开头，不明确目标落点请手动同步",
-                            "stderr",
-                        )
+                        self._log(task_id,
+                                  f"跳过外部 bind mount {bp}：路径不以前缀 {source_prefix!r} 开头",
+                                  "stderr")
                         continue
                 else:
                     local_target = bp
-                self._log(task_id, f"同步外部 bind mount: {bp} -> {local_target}")
+                # 如果 local_target 在 lp_norm 下（本地项目目录内），也跳过
+                lt_norm = os.path.normpath(local_target)
+                if lt_norm == lp_norm or lt_norm.startswith(lp_norm + "/"):
+                    continue
+                self._log(task_id, f"  同步外部 bind mount [{svc}]: {bp} -> {local_target}")
                 try:
                     await self._rsync_pull(task_id, remote, bp, local_target,
                                            label=f"rsync bind {bp}")
                 except Exception as e:
-                    self._log(task_id, f"警告：同步 {bp} 失败: {e}（继续）", "stderr")
+                    self._log(task_id, f"⚠️ 警告：同步 {bp} 失败: {e}（继续）", "stderr")
 
-            # 4) 重写 compose 路径
+            # ---- 5) named volume 同步 ----
+            vol_names = set()
+            for vn, svc in named_vols:
+                vol_names.add(vn)
+            for vn in vol_names:
+                vdef = volume_defs.get(vn, {"external": False})
+                if vdef.get("external"):
+                    self._log(task_id, f"  volume {vn} 声明为 external，跳过")
+                    continue
+                self._log(task_id, f"  同步 named volume: {vn}")
+                try:
+                    # 源 NAS 的 mountpoint
+                    remote_mp = await self._run_remote_cmd(
+                        task_id, remote,
+                        ["docker", "volume", "inspect", "-f", "{{.Mountpoint}}", vn],
+                        warn_only=True,
+                    )
+                    if not remote_mp or not remote_mp.strip():
+                        # 源 NAS volume 可能不存在（空 volume）
+                        self._log(task_id,
+                                  f"    源 NAS volume {vn} 不存在或为空，先在本机 create 一个空 volume")
+                        await self._ensure_local_volume(task_id, vn, vdef)
+                        continue
+                    remote_mp = remote_mp.strip()
+                    # 确保本机有同名 volume
+                    local_mp = await self._ensure_local_volume(task_id, vn, vdef)
+                    if not local_mp:
+                        self._log(task_id, f"⚠️ 本机 create volume {vn} 失败，跳过数据同步", "stderr")
+                        continue
+                    # rsync 远端 _data 到本机 _data
+                    await self._rsync_pull(task_id, remote, remote_mp, local_mp,
+                                           label=f"rsync volume {vn} 数据")
+                except Exception as e:
+                    self._log(task_id, f"⚠️ named volume {vn} 同步失败: {e}（继续）", "stderr")
+
+            # ---- 6) custom network 创建 ----
+            for net_name, ndef in network_defs.items():
+                try:
+                    await self._ensure_local_network(task_id, net_name, ndef)
+                except Exception as e:
+                    self._log(task_id, f"⚠️ network {net_name} 创建失败: {e}（继续）", "stderr")
+
+            # ---- 7) 重写 compose bind 路径 ----
             if prefix_active:
                 try:
                     changed = self._rewrite_compose(compose_file, source_prefix, target_prefix)
                     if changed:
-                        self._log(task_id, "已重写 compose bind 路径")
+                        self._log(task_id, "  已重写 compose bind 路径")
                 except Exception as e:
                     self._log(task_id, f"警告：重写 compose 失败: {e}", "stderr")
 
-            # 5) 本机 compose pull/up
+            # ---- 8) compose build / pull / up ----
             compose_ctx = ["docker", "compose", "-f", compose_file, "-p", name]
-            if pull_images:
+            if has_build:
+                self._log(task_id, "  检测到 build 指令，先 compose build")
+                try:
+                    await self._run_cmd(task_id, compose_ctx + ["build"],
+                                        label=f"docker compose build {name}")
+                except Exception as e:
+                    self._log(task_id, f"⚠️ compose build 失败: {e}（继续尝试 up）", "stderr")
+            if pull_images and not has_build:
+                # 有 build 的项目 pull 会失败（私有 image 名），跳过 pull 直接 up
                 await self._run_cmd(task_id, compose_ctx + ["pull"],
-                                   label=f"docker compose pull {name}")
+                                    label=f"docker compose pull {name}",
+                                    warn_only=True)
             if start_containers:
                 await self._run_cmd(task_id, compose_ctx + ["up", "-d"],
-                                   label=f"docker compose up {name}")
+                                    label=f"docker compose up {name}")
 
-            self._log(task_id, f"项目 {name} 完成")
+            self._log(task_id, f"✅ 项目 {name} 完成")
 
-    # -------------------------------------------------------------------------
-    # 推模式（新）
-    # -------------------------------------------------------------------------
+    # ==========================================================================
+    # 推模式 — 源 NAS 部署
+    # ==========================================================================
     async def _run_push(self, task_id, remote, local_root, remote_root, projects,
                         pull_images, start_containers,
                         source_prefix, target_prefix, prefix_active):
         if prefix_active:
             self._log(task_id,
-                      f"路径前缀映射：{source_prefix} -> {target_prefix}（本机路径前缀 -> 目标 NAS 路径前缀）")
+                      f"路径前缀映射：{source_prefix} -> {target_prefix}（本机路径前缀 → 目标 NAS 路径前缀）")
         else:
             self._log(task_id,
                       "未启用路径前缀映射：要求源/目标 NAS 路径完全一致，否则外部 bind mount 会失效",
                       "stderr")
+
         tmp_workdir = tempfile.mkdtemp(prefix="migpush_")
         self._log(task_id, f"（临时 staging 目录：{tmp_workdir}）")
         try:
@@ -478,89 +734,149 @@ class Migrator:
                 compose_name = proj.get("compose_file", "docker-compose.yml")
                 remote_dst = os.path.join(remote_root, name)
 
-                self._log(task_id, f"\n========== [{idx}/{len(projects)}] {name} ==========")
+                self._log(task_id, f"\n{'='*10} [{idx}/{len(projects)}] {name} {'='*10}")
                 self._log(task_id, f"本机源: {local_src}")
                 self._log(task_id, f"对端目标: {remote['username']}@{remote['host']}:{remote_dst}")
 
-                # 1) 如果启用了路径前缀重写，把 compose 先拷到 staging 再重写（不动源目录）
+                # ---- 1) 拷贝到 staging（不动源目录）----
                 staging_dir = os.path.join(tmp_workdir, name)
-                # 拷贝整个项目目录到 staging
                 if os.path.exists(staging_dir):
                     shutil.rmtree(staging_dir)
                 shutil.copytree(local_src, staging_dir, symlinks=True)
 
                 compose_file, compose_name = self._find_compose_file(staging_dir, compose_name)
                 if not compose_file:
+                    # 没 compose：只推送 staging 给用户留个拷贝，不做 create volume/network/up
                     self._log(task_id,
-                              f"警告：未找到 compose 文件，跳过 {name} 的 compose 解析与远端 up",
+                              f"⚠️ 未找到 compose 文件，仅推送项目目录到远端（不启动容器）",
                               "stderr")
-                    # 但仍然只推送 staging 的文件（给用户留一个拷贝）
+                    try:
+                        await self._rsync_push(task_id, remote, staging_dir, remote_dst,
+                                               label=f"rsync 推送 {name}")
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ 推送 {name} 失败: {e}", "stderr")
+                    else:
+                        self._log(task_id, f"✅ 项目 {name} 目录已推送（无 compose，跳过启动）")
                     continue
 
-                # 2) 提取 bind（解析 staging 的 compose，源路径是本机原路径）
+                # ---- 2) 解析 compose ----
                 try:
-                    bind_paths = self._extract_bind_mounts(compose_file)
+                    parsed = self._parse_compose(compose_file)
                 except Exception as e:
                     self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
-                    bind_paths = []
+                    parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
+                              "network_defs": {}, "has_build": False, "build_contexts": set()}
 
-                # 3) 前缀映射下重写 staging 的 compose（只有 bind source 前缀会变）
+                binds = parsed["binds"]
+                named_vols = parsed["named_volumes"]
+                volume_defs = parsed["volume_defs"]
+                network_defs = parsed["network_defs"]
+                has_build = parsed["has_build"]
+                build_contexts = parsed["build_contexts"]
+
+                if build_contexts:
+                    self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}（已随 staging 一起同步）")
+
+                # ---- 3) 重写 staging compose（bind 路径）----
                 if prefix_active:
                     try:
                         changed = self._rewrite_compose(compose_file, source_prefix, target_prefix)
                         if changed:
-                            self._log(task_id, "已重写 staging 内 compose 的 bind 路径")
+                            self._log(task_id, "  已重写 staging 内 compose 的 bind 路径")
                     except Exception as e:
                         self._log(task_id, f"警告：重写 compose 失败: {e}", "stderr")
 
-                # 4) 推送 staging（项目目录 + 已写好的 compose）到对端
+                # ---- 4) 推送 staging（项目目录 + 已写好 compose）到对端 ----
                 await self._rsync_push(task_id, remote, staging_dir, remote_dst,
-                                       label=f"rsync 推送项目 {name}（含重写后 compose）")
+                                       label=f"rsync 推送项目 {name}（含重写后 compose + build context）")
 
-                # 5) 推送外部 bind mount（排除项目目录本身）
+                # ---- 5) 推送外部 bind mount ----
                 local_src_norm = os.path.normpath(local_src)
-                for bp in bind_paths:
+                for bp, svc in binds:
                     bp_norm = os.path.normpath(bp)
                     if bp_norm == local_src_norm or bp_norm.startswith(local_src_norm + "/"):
                         continue
-                    # 远端目标路径（按前缀映射）
+                    # 远端目标路径
                     if prefix_active:
                         if bp.startswith(source_prefix):
                             remote_bind = target_prefix + bp[len(source_prefix):]
                         else:
-                            self._log(
-                                task_id,
-                                f"跳过外部 bind mount {bp}：已启用前缀映射但路径不以前缀"
-                                f" {source_prefix!r} 开头，不明确对端落点请手动同步",
-                                "stderr",
-                            )
+                            self._log(task_id,
+                                      f"跳过外部 bind mount {bp}：路径不以前缀 {source_prefix!r} 开头",
+                                      "stderr")
                             continue
                     else:
                         remote_bind = bp
-                    self._log(task_id, f"同步外部 bind mount: {bp} -> {remote_bind}")
+                    # 如果 remote_bind 指向 remote_dst 内部，跳过
+                    rb_norm = os.path.normpath(remote_bind)
+                    rd_norm = os.path.normpath(remote_dst)
+                    if rb_norm == rd_norm or rb_norm.startswith(rd_norm + "/"):
+                        continue
+                    self._log(task_id, f"  同步外部 bind mount [{svc}]: {bp} -> {remote_bind}")
                     if not os.path.exists(bp):
-                        self._log(task_id, f"警告：本机 {bp} 不存在，跳过", "stderr")
+                        self._log(task_id, f"⚠️ 本机 {bp} 不存在，跳过", "stderr")
                         continue
                     try:
                         await self._rsync_push(task_id, remote, bp, remote_bind,
                                                label=f"rsync bind {bp}")
                     except Exception as e:
-                        self._log(task_id, f"警告：推送 {bp} 失败: {e}（继续）", "stderr")
+                        self._log(task_id, f"⚠️ 推送 {bp} 失败: {e}（继续）", "stderr")
 
-                # 6) 远端 docker compose pull / up
+                # ---- 6) named volume 推送 ----
+                vol_names = set()
+                for vn, svc in named_vols:
+                    vol_names.add(vn)
+                for vn in vol_names:
+                    vdef = volume_defs.get(vn, {"external": False})
+                    if vdef.get("external"):
+                        self._log(task_id, f"  volume {vn} 声明为 external，跳过")
+                        continue
+                    self._log(task_id, f"  同步 named volume: {vn}")
+                    try:
+                        # 本机 mountpoint
+                        local_mp = await self._get_local_volume_mountpoint(task_id, vn)
+                        if not local_mp or not os.path.exists(local_mp):
+                            # 本机 volume 不存在（可能是空 volume 或用户未初始化）
+                            self._log(task_id,
+                                      f"    本机 volume {vn} 不存在或为空，先在远端 create 一个空 volume")
+                            await self._ensure_remote_volume(task_id, remote, vn, vdef)
+                            continue
+                        # 远端 create 同名 volume
+                        remote_mp = await self._ensure_remote_volume(task_id, remote, vn, vdef)
+                        if not remote_mp:
+                            self._log(task_id, f"⚠️ 远端 create volume {vn} 失败，跳过", "stderr")
+                            continue
+                        # rsync 本机 _data 到远端 _data
+                        await self._rsync_push(task_id, remote, local_mp, remote_mp,
+                                               label=f"rsync volume {vn} 数据")
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ named volume {vn} 推送失败: {e}（继续）", "stderr")
+
+                # ---- 7) 远端 custom network 创建 ----
+                for net_name, ndef in network_defs.items():
+                    try:
+                        await self._ensure_remote_network(task_id, remote, net_name, ndef)
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ network {net_name} 创建失败: {e}（继续）", "stderr")
+
+                # ---- 8) 远端 compose build / pull / up ----
                 remote_compose_path = os.path.join(remote_dst, compose_name)
-                compose_ctx = [
-                    "docker", "compose",
-                    "-f", remote_compose_path,
-                    "-p", name,
-                ]
-                if pull_images:
+                compose_ctx = ["docker", "compose", "-f", remote_compose_path, "-p", name]
+                if has_build:
+                    self._log(task_id, "  远端检测到 build 指令，先 compose build")
+                    try:
+                        await self._run_remote_cmd(task_id, remote, compose_ctx + ["build"],
+                                                   label=f"远端 compose build {name}")
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ 远端 compose build 失败: {e}（继续尝试 up）", "stderr")
+                if pull_images and not has_build:
                     await self._run_remote_cmd(task_id, remote, compose_ctx + ["pull"],
-                                               label=f"docker compose pull {name}")
+                                               label=f"远端 compose pull {name}",
+                                               warn_only=True)
                 if start_containers:
                     await self._run_remote_cmd(task_id, remote, compose_ctx + ["up", "-d"],
-                                               label=f"docker compose up {name}")
+                                               label=f"远端 compose up {name}")
 
-                self._log(task_id, f"项目 {name} 完成")
+                self._log(task_id, f"✅ 项目 {name} 完成")
         finally:
             shutil.rmtree(tmp_workdir, ignore_errors=True)

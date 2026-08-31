@@ -55,14 +55,14 @@ class SSHClient:
 
     # ---------- 扫描 compose ----------
     def list_projects(self, docker_root):
-        """扫描远程 docker_root 下（最多 2 层）的 compose 文件，返回项目列表。
+        """扫描远程 docker_root 下（最多 4 层）的 compose 文件，返回项目列表。
         项目列表里每条含 name / remote_path / compose_file / size。
         """
         client = self._connect()
         try:
             root = shlex.quote(docker_root)
             cmd = (
-                f"find {root} -maxdepth 2 "
+                f"find {root} -maxdepth 4 "
                 r"\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
                 r"-o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null"
             )
@@ -106,7 +106,7 @@ class SSHClient:
         try:
             root = shlex.quote(docker_root)
             find_cmd = (
-                f"find {root} -maxdepth 2 "
+                f"find {root} -maxdepth 4 "
                 r"\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
                 r"-o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null"
             )
