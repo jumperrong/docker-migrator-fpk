@@ -1,28 +1,39 @@
 # 飞牛 Docker 迁移工具（生产镜像，安装时由飞牛 appcenter 构建）
 #
-# 依赖预置策略（尽量减少安装时联网）：
-#   - Python wheels：随包提供于 wheels/，pip --no-index 离线安装，不访问 PyPI。
-#   - docker CLI + compose 插件：随包提供于 bin/，COPY 进镜像，不访问 docker hub。
-#   - rsync / sshpass / openssh-client：apt 安装，走飞牛 debian 源（国内快且稳）。
-# 仅剩 python:3.11-slim 基础镜像需 docker hub 拉取（飞牛 NAS 通常已缓存或可走镜像加速）。
+# 多架构兼容：x86_64 (AMD64) 和 ARM64 均可。
+# docker CLI + compose 插件：构建时按容器架构自动下载对应二进制。
+# Python 依赖：pip 在线安装，自动匹配容器架构的 wheel。
+# rsync / sshpass / openssh-client：apt 安装，走飞牛 debian 源。
 
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    rsync sshpass openssh-client ca-certificates \
+    rsync sshpass openssh-client ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# docker CLI + compose 插件（预置静态二进制，x86_64）
-COPY bin/docker /usr/local/bin/docker
-COPY bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
-RUN chmod +x /usr/local/bin/docker /usr/local/lib/docker/cli-plugins/docker-compose
+# docker CLI + compose 插件（按容器架构自动选择对应二进制）
+RUN set -eux; \
+    ARCH=$(dpkg --print-architecture); \
+    case "$ARCH" in \
+      amd64) DOCKER_ARCH=x86_64;  COMPOSE_ARCH=x86_64;  ;; \
+      arm64) DOCKER_ARCH=arm64;   COMPOSE_ARCH=aarch64; ;; \
+      *) echo "!! 不支持的架构: $ARCH"; exit 1; ;; \
+    esac; \
+    curl -fsSL --max-time 120 \
+      "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/${DOCKER_ARCH}/docker-24.0.7.tgz" \
+      | tar -xz -C /tmp; \
+    mv /tmp/docker/docker /usr/local/bin/docker; \
+    mkdir -p /usr/local/lib/docker/cli-plugins; \
+    curl -fsSL --max-time 120 -o /usr/local/lib/docker/cli-plugins/docker-compose \
+      "https://github.com/docker/compose/releases/download/v2.23.3/docker-compose-linux-${COMPOSE_ARCH}"; \
+    chmod +x /usr/local/bin/docker /usr/local/lib/docker/cli-plugins/docker-compose; \
+    rm -rf /tmp/docker
 
 WORKDIR /app
 
-# 离线安装 Python 依赖（wheels 已随包提供）
-COPY wheels /wheels
+# 在线安装 Python 依赖（pip 根据容器架构自动选择正确的 wheel）
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
