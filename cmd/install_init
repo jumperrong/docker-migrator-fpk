@@ -1,0 +1,17 @@
+#!/bin/bash
+# 安装前钩子（飞牛在解 app.tgz 与 compose up 之前调用）。
+# 仅做环境校验与目录准备，不动 compose 文件（app.tgz 会覆盖）。
+set -uo pipefail
+log() { echo "[$(date '+%F_%T')] [install_init] $*"; }
+
+log "Docker 迁移工具 install_init"
+log "TRIM_APPDEST=${TRIM_APPDEST:-?}  TRIM_PKGVAR=${TRIM_PKGVAR:-?}"
+
+command -v docker >/dev/null 2>&1 || { echo "docker CLI 未找到" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker daemon 不可用" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+
+mkdir -p "${TRIM_PKGVAR}" || { echo "创建 ${TRIM_PKGVAR} 失败" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+
+log "向导目标根目录: ${wizard_docker_root:-/vol1/1000/docker}"
+log "接下来飞牛解 app.tgz 并 docker compose up（构建镜像，需联网）"
+exit 0

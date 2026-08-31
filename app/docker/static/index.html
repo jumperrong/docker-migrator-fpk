@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>飞牛 Docker 迁移工具</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d24;
+    --border: #2a2e38;
+    --txt: #e6e8eb;
+    --sub: #9aa0aa;
+    --accent: #4f9cff;
+    --accent2: #36c98f;
+    --err: #ff6b6b;
+    --code-bg: #0c0e12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header .sub { color: var(--sub); margin: 0 0 24px; font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 18px 16px; margin-bottom: 18px;
+  }
+  .card h2 { margin: 0 0 14px; font-size: 15px; color: var(--accent); font-weight: 600; }
+  .card h2 .dir-badge {
+    display:inline-block; margin-left:10px; padding:2px 10px;
+    border-radius:12px; font-size:11px; font-weight:500;
+    background:#1a3a5e; color:#8bbfff; vertical-align:middle;
+  }
+  .mode-bar {
+    display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap;
+  }
+  .mode-bar label {
+    display:inline-flex; align-items:center; gap:6px; padding:8px 14px;
+    border:1px solid var(--border); border-radius:8px; cursor:pointer;
+    background:var(--code-bg);
+  }
+  .mode-bar label:hover { border-color:var(--accent); }
+  .mode-bar label input { margin:0; }
+  .mode-bar label b { color:var(--accent2); font-weight:600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: 12px; margin-bottom: 12px; }
+  label.field { display: block; }
+  label.field > span { display: block; color: var(--sub); font-size: 12px; margin-bottom: 4px; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%; background: var(--code-bg); border: 1px solid var(--border);
+    color: var(--txt); border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .full { width: 100%; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 9px 18px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--sub); font-weight: 400; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .status { font-size: 13px; }
+  .ok { color: var(--accent2); }
+  .err { color: var(--err); }
+  .muted { color: var(--sub); }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--sub); font-weight: 500; font-size: 12px; }
+  td.name { font-family: ui-monospace, "SF Mono", Consolas, monospace; color: var(--accent2); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .opts { display: flex; gap: 22px; margin: 10px 0 14px; }
+  .opts label { display: inline-flex; align-items: center; gap: 6px; color: var(--sub); }
+  pre.log {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; height: 360px; overflow: auto; margin: 0;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12px;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .log-line.err { color: var(--err); }
+  .log-line.cmd { color: #7fb3ff; }
+  .log-line.hint {
+    color: #ffd479;
+    background: rgba(255,212,121,.07);
+    border-left: 3px solid #ffd479;
+    padding: 4px 10px;
+    margin: 4px 0;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+  .empty { color: var(--sub); padding: 18px; text-align: center; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; background:#2a2e38; color:var(--sub); }
+  details { margin:8px 0 14px; }
+  details summary { cursor:pointer; color:var(--sub); font-size:12px; }
+  code { background:#0c0e12; padding:1px 5px; border-radius:3px; color:#b7e1ff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>飞牛 Docker 迁移工具</h1>
+    <p class="sub" id="headerSub">先在下方选择本应用是部署在哪台 NAS 上，然后按流程操作。</p>
+  </header>
+
+  <!-- 0. 部署模式（方向） -->
+  <section class="card">
+    <h2>0. 选择部署位置</h2>
+    <div class="mode-bar">
+      <label><input type="radio" name="mode" value="pull" onchange="onModeChange()">
+        <b>部署在目标 NAS</b>（从源 NAS 拉取，目标 NAS 拉模式）</label>
+      <label><input type="radio" name="mode" value="push" onchange="onModeChange()">
+        <b>部署在源 NAS</b>（推送到目标 NAS，源 NAS 推模式）</label>
+    </div>
+    <p class="muted" id="modeHint" style="font-size:12px;margin:6px 0 0">
+      拉模式推荐：只需要目标 NAS 能 SSH 到源 NAS。<br>
+      推模式适用：源 NAS 能外连、目标 NAS 在另一侧网络。
+    </p>
+  </section>
+
+  <!-- 1. 连接对端 NAS -->
+  <section class="card">
+    <h2>1. 连接<span id="dirConn" class="dir-badge">源 NAS</span></h2>
+    <div class="grid">
+      <label class="field"><span>主机 IP</span><input type="text" id="host" placeholder="192.168.1.100"></label>
+      <label class="field"><span>SSH 端口</span><input type="number" id="port" value="22"></label>
+      <label class="field"><span>用户名</span><input type="text" id="username" value="root"></label>
+      <label class="field"><span>密码</span><input type="password" id="password"></label>
+    </div>
+    <label class="field" style="margin-bottom:12px"><span id="remoteRootLabel">对端 NAS 上 Docker 项目根目录</span>
+      <input type="text" id="remoteRoot" class="full" value="/vol1/1000/docker">
+    </label>
+    <div class="row">
+      <button id="btnConnect" onclick="connect()">连接并扫描</button>
+      <span id="connStatus" class="status muted"></span>
+    </div>
+  </section>
+
+  <!-- 2. 选择项目 -->
+  <section class="card">
+    <h2>2. 选择迁移项目</h2>
+    <div class="toolbar">
+      <button class="ghost" onclick="selectAll(true)">全选</button>
+      <button class="ghost" onclick="selectAll(false)">全不选</button>
+      <span id="scanInfo" class="muted"></span>
+    </div>
+    <table id="projTable">
+      <thead><tr><th style="width:40px"></th><th>项目名</th><th id="thPath">源路径</th><th>大小</th></tr></thead>
+      <tbody><tr><td colspan="4" class="empty">未连接</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- 3. 目标与选项 -->
+  <section class="card">
+    <h2>3. 目标路径与选项</h2>
+    <label class="field" style="margin-bottom:6px"><span id="localRootLabel">本机 Docker 项目根目录（需与容器挂载路径一致）</span>
+      <input type="text" id="localRoot" class="full" value="/vol1/1000/docker">
+    </label>
+    <div class="opts">
+      <label><input type="checkbox" id="pullImages" checked> 迁移后拉取镜像</label>
+      <label><input type="checkbox" id="startContainers" checked> 启动容器</label>
+    </div>
+    <details>
+      <summary>高级：路径前缀映射（两台 NAS 路径不同时必填）</summary>
+      <p class="muted" style="font-size:12px;margin:8px 0">
+        例如源 NAS 为 <code>/vol1/1000</code>、目标 NAS 为 <code>/vol2/1000</code>，填入下方。
+        迁移时会自动同步 compose 里以源前缀开头的外部 bind mount 路径，并把 compose 路径改写到目标前缀。
+        两台 NAS 路径完全一致时留空即可。
+      </p>
+      <div class="grid">
+        <label class="field"><span id="spLabel">源 NAS 前缀</span>
+          <input type="text" id="sourcePrefix" placeholder="/vol1/1000">
+        </label>
+        <label class="field"><span id="tpLabel">目标 NAS 前缀</span>
+          <input type="text" id="targetPrefix" placeholder="/vol2/1000">
+        </label>
+      </div>
+    </details>
+    <div class="row">
+      <button id="btnMigrate" onclick="migrate()" disabled>开始迁移</button>
+      <span id="migStatus" class="status muted"></span>
+    </div>
+  </section>
+
+  <!-- 4. 日志 -->
+  <section class="card">
+    <h2>迁移日志</h2>
+    <pre id="log" class="log"></pre>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let projects = [];
+let es = null;
+let mode = 'pull';  // 'pull' = 本应用在目标 NAS 拉；'push' = 本应用在源 NAS 推
+
+// 从后端读取安装时注入的「本机」根目录默认值
+(async () => {
+  try {
+    const r = await fetch('/api/defaults');
+    if (r.ok) {
+      const d = await r.json();
+      if (d.local_docker_root) $('localRoot').value = d.local_docker_root;
+    }
+  } catch (e) {}
+  // 默认选中 pull
+  document.querySelector('input[name="mode"][value="pull"]').checked = true;
+  onModeChange();
+})();
+
+function onModeChange() {
+  mode = document.querySelector('input[name="mode"]:checked').value;
+  const conn = $('dirConn'), header = $('headerSub'),
+        remoteLabel = $('remoteRootLabel'), thPath = $('thPath'),
+        localLabel = $('localRootLabel'), sp = $('spLabel'), tp = $('tpLabel');
+  if (mode === 'pull') {
+    conn.textContent = '源 NAS';
+    header.innerHTML = '本工具部署在<strong>目标 NAS</strong>上，通过 SSH 连接源 NAS，用 rsync 拉取 Docker 项目并在本机启动。';
+    remoteLabel.textContent = '源 NAS 上 Docker 项目根目录';
+    thPath.textContent = '源路径';
+    localLabel.textContent = '本机（目标 NAS）Docker 项目根目录（需与容器挂载路径一致）';
+    sp.textContent = '源 NAS 前缀';
+    tp.textContent = '目标 NAS（本机）前缀';
+  } else {
+    conn.textContent = '目标 NAS';
+    header.innerHTML = '本工具部署在<strong>源 NAS</strong>上，通过 SSH 连接目标 NAS，把本机 Docker 项目用 rsync 推送到对端并在对端启动。';
+    remoteLabel.textContent = '目标 NAS 上 Docker 项目根目录';
+    thPath.textContent = '本机路径（要推送的源目录）';
+    localLabel.textContent = '本机（源 NAS）Docker 项目根目录（需与容器挂载路径一致）';
+    sp.textContent = '源 NAS（本机）前缀';
+    tp.textContent = '目标 NAS 前缀';
+  }
+}
+
+function setConn(text, cls) {
+  const el = $('connStatus');
+  el.textContent = text; el.className = 'status ' + (cls || 'muted');
+}
+
+async function connect() {
+  const body = {
+    host: $('host').value.trim(),
+    port: parseInt($('port').value) || 22,
+    username: $('username').value.trim(),
+    password: $('password').value,
+    // 「拉模式」：扫描远端（源 NAS）的项目
+    // 「推模式」：扫描本机（源 NAS）的项目，然后连接到远端（目标 NAS）验证 ssh 可达
+    scan_local: (mode === 'push'),
+    local_docker_root: $('localRoot').value.trim(),
+    remote_docker_root: $('remoteRoot').value.trim(),
+  };
+  if (!body.host) { setConn('请填写对端主机 IP', 'err'); return; }
+  $('btnConnect').disabled = true;
+  setConn('连接中…');
+  try {
+    const r = await fetch('/api/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await r.json();
+    if (!r.ok) { setConn('连接失败：' + (data.detail||''), 'err'); $('btnConnect').disabled=false; return; }
+    setConn(mode === 'pull' ? '已连接源 NAS ✓' : '已连接目标 NAS + 扫描本机 ✓', 'ok');
+    await loadProjects();
+  } catch (e) {
+    setConn('连接失败：' + e, 'err');
+  } finally {
+    $('btnConnect').disabled = false;
+  }
+}
+
+async function loadProjects() {
+  $('scanInfo').textContent = '扫描中…';
+  try {
+    const r = await fetch('/api/projects');
+    const data = await r.json();
+    if (!r.ok) { $('scanInfo').textContent = '扫描失败：' + (data.detail||''); return; }
+    projects = data.projects || [];
+    renderProjects();
+    const rootHint = mode === 'pull'
+      ? `源 NAS 根目录 ${data.docker_root}`
+      : `本机根目录 ${data.docker_root}`;
+    $('scanInfo').textContent = `共 ${projects.length} 个项目（${rootHint}）`;
+    $('btnMigrate').disabled = projects.length === 0;
+  } catch (e) {
+    $('scanInfo').textContent = '扫描失败：' + e;
+  }
+}
+
+function renderProjects() {
+  const tb = $('projTable').querySelector('tbody');
+  if (!projects.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">未发现 Docker 项目</td></tr>';
+    return;
+  }
+  tb.innerHTML = projects.map((p,i) => `
+    <tr>
+      <td><input type="checkbox" class="pc" data-i="${i}" checked></td>
+      <td class="name">${escapeHtml(p.name)}</td>
+      <td class="muted">${escapeHtml(p.remote_path||p.local_path||'')}</td>
+      <td>${escapeHtml(p.size||'')}</td>
+    </tr>`).join('');
+}
+
+function selectAll(b) {
+  document.querySelectorAll('.pc').forEach(c => c.checked = b);
+}
+
+function selectedProjects() {
+  const ids = [];
+  document.querySelectorAll('.pc').forEach(c => { if (c.checked) ids.push(+c.dataset.i); });
+  return ids.map(i => projects[i]);
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+function appendLog(text, cls) {
+  const pre = $('log');
+  const div = document.createElement('div');
+  div.className = 'log-line ' + (cls||'');
+  div.textContent = text;
+  pre.appendChild(div);
+  pre.scrollTop = pre.scrollHeight;
+}
+
+async function migrate() {
+  const sel = selectedProjects();
+  if (!sel.length) { setMig('请至少选择一个项目', 'err'); return; }
+  const body = {
+    direction: mode,           // pull | push
+    local_docker_root: $('localRoot').value.trim(),
+    remote_docker_root: $('remoteRoot').value.trim(),
+    projects: sel.map(p => ({name:p.name, remote_path:p.remote_path, local_path:p.local_path, compose_file:p.compose_file, size:p.size})),
+    pull_images: $('pullImages').checked,
+    start_containers: $('startContainers').checked,
+    source_prefix: $('sourcePrefix').value.trim(),
+    target_prefix: $('targetPrefix').value.trim(),
+  };
+  if (!!body.source_prefix !== !!body.target_prefix) {
+    setMig('路径前缀需成对填写（都填或都空）', 'err'); return;
+  }
+  $('log').innerHTML = '';
+  $('btnMigrate').disabled = true;
+  setMig('提交中…');
+  try {
+    const r = await fetch('/api/migrate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await r.json();
+    if (!r.ok) { setMig('提交失败：' + (data.detail||''), 'err'); $('btnMigrate').disabled=false; return; }
+    setMig(mode === 'pull' ? '拉取迁移中…' : '推送迁移中…', 'muted');
+    streamLog(data.task_id);
+  } catch (e) {
+    setMig('提交失败：' + e, 'err');
+    $('btnMigrate').disabled = false;
+  }
+}
+
+function streamLog(taskId) {
+  if (es) es.close();
+  es = new EventSource(`/api/tasks/${taskId}/stream`);
+  es.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.line !== undefined) {
+      let cls = '';
+      if (d.stream === 'stderr') cls = 'err';
+      else if (d.line.startsWith('$ ')) cls = 'cmd';
+      if (typeof d.line === 'string' && d.line.startsWith('💡')) cls = 'hint';
+      appendLog(d.line, cls);
+    }
+    if (d.status === 'done') {
+      setMig('迁移完成 ✓', 'ok');
+      es.close(); es=null; $('btnMigrate').disabled = false;
+    } else if (d.status === 'error') {
+      setMig('迁移出错（见日志）', 'err');
+      es.close(); es=null; $('btnMigrate').disabled = false;
+    }
+  };
+  es.onerror = () => { setMig('日志连接中断', 'err'); };
+}
+
+function setMig(text, cls) {
+  const el = $('migStatus'); el.textContent = text; el.className = 'status ' + (cls||'muted');
+}
+</script>
+</body>
+</html>

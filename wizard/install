@@ -1,0 +1,30 @@
+[
+    {
+        "stepTitle": "Docker 迁移工具部署配置",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "本工具部署在<b>目标 NAS</b>上，安装时会构建镜像（仅 python:3.11-slim 基础镜像 + apt 系统包需联网，约 2-5 分钟；docker CLI 与 Python 依赖均已随包提供，无需访问 docker hub / PyPI）。装完后桌面出现「Docker 迁移工具」图标，点开即用 WebUI 连接源 NAS 拉取项目。"
+            },
+            {
+                "type": "tips",
+                "helpText": "下方「目标 Docker 根目录」是迁移项目落地的位置。飞牛常见路径为 <code>/vol1/1000/docker</code>。容器会以同一路径挂载，保证迁移项目的相对目录映射正确。如不确定，保持默认即可，装好后在 WebUI 里也能改。"
+            },
+            {
+                "type": "tips",
+                "helpText": "注意：飞牛 fnOS 会以原 field 名（即 <code>wizard_docker_root</code>）作为环境变量名注入 cmd 脚本与 compose 进程，故 docker-compose.yaml 直接用 <code>${wizard_docker_root}</code> 读取。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_docker_root",
+                "label": "目标 Docker 根目录",
+                "initValue": "/vol1/1000/docker",
+                "description": "迁移过来的项目会放到这个目录下，并在此目录用 docker compose 启动。",
+                "rules": [
+                    { "required": true, "message": "请填写目标 Docker 根目录" },
+                    { "pattern": "^/vol[0-9]+/.+", "message": "路径需以 /vol 开头，例如 /vol1/1000/docker" }
+                ]
+            }
+        ]
+    }
+]

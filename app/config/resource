@@ -1,0 +1,13 @@
+{
+    "docker-project": {
+        "projects": [
+            {
+                "name": "dockermigrator",
+                "path": "docker"
+            }
+        ]
+    },
+    "data-share": {
+        "shares": []
+    }
+}

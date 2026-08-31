@@ -1,0 +1,31 @@
+name: dockermigrator
+
+# 飞牛 fnOS 应用 compose。
+# 飞牛 appcenter 在 docker compose up 时会把 wizard 字段 + TRIM_* 系统变量
+# 以环境变量形式注入 compose 进程，docker compose 原生 ${VAR} 替换生效
+# （.env 不被飞牛读取，只能走 ${VAR}）。
+#
+#   wizard_docker_root  目标 NAS 上 Docker 项目根目录（安装向导收集）
+#                       容器以「同一路径」挂载，保证迁移项目的相对 bind mount
+#                       在容器内与宿主路径一致，可被宿主 docker 正确挂载。
+#   LOCAL_DOCKER_ROOT   传给应用，作为 WebUI「本机根目录」默认值。
+#
+# 权限说明：config/privilege 指定 run-as=package，本应用通过 docker-project
+# 资源声明，飞牛会自动把 package 用户加入 docker 组，故宿主侧 cmd/main 调用
+# docker compose 时可访问 /var/run/docker.sock。容器内进程为 root，写挂载点
+# 的用户数据路径无问题。
+
+services:
+  dockermigrator:
+    build: .
+    image: dockermigrator:latest
+    container_name: dockermigrator
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${wizard_docker_root:-/vol1/1000/docker}:${wizard_docker_root:-/vol1/1000/docker}
+    environment:
+      - TZ=Asia/Shanghai
+      - LOCAL_DOCKER_ROOT=${wizard_docker_root:-/vol1/1000/docker}

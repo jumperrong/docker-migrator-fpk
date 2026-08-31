@@ -1,0 +1,32 @@
+#!/bin/bash
+# Docker 迁移工具 — 容器生命周期脚本
+# docker-project 资源声明的应用，飞牛 appcenter 在安装/卸载时会自动 compose up/down；
+# 本脚本的 start/stop 也实现 compose up/down（幂等，与 appcenter 不冲突），
+# status 探测主容器是否运行。
+set -uo pipefail
+
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+PROJECT="dockermigrator"
+CONTAINER="dockermigrator"
+
+err() { echo "$*" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+
+case "$1" in
+  start)
+    docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d \
+      || err "启动失败：docker compose up 出错，请检查日志"
+    ;;
+  stop)
+    docker compose -f "$COMPOSE_FILE" -p "$PROJECT" down \
+      || err "停止失败：docker compose down 出错"
+    ;;
+  status)
+    # 用 --format 精确取 State.Status，避免 inspect 全量 JSON 里其它字段误匹配
+    st="$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || true)"
+    [ "$st" = "running" ] && exit 0
+    exit 3
+    ;;
+  *)
+    exit 1
+    ;;
+esac

@@ -1,0 +1,5 @@
+#!/bin/bash
+# 卸载前钩子：兜底停容器（appcenter 通常已 compose down）。
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+docker compose -f "$COMPOSE_FILE" -p dockermigrator down >/dev/null 2>&1 || true
+exit 0

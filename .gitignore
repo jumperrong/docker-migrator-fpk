@@ -1,0 +1,9 @@
+# 构建产物
+*.fpk
+app.tgz
+__pycache__/
+*.pyc
+
+# 预置二进制/wheels（通过 build.sh 重新下载）
+app/docker/bin/
+app/docker/wheels/

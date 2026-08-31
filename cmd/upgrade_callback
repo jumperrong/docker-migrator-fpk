@@ -1,0 +1,10 @@
+#!/bin/bash
+# 升级后钩子：appcenter 已用新文件 compose up；这里强制重建镜像以应用代码更新。
+set -uo pipefail
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+log() { echo "[$(date '+%F_%T')] [upgrade] $*"; }
+log "重建镜像以应用更新代码..."
+docker compose -f "$COMPOSE_FILE" -p dockermigrator up -d --build >/dev/null 2>&1 \
+  || { echo "升级重建失败，请手动 docker compose up -d --build" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+log "升级完成。"
+exit 0
