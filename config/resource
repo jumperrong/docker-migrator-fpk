@@ -1,6 +1,10 @@
 {
     "docker-project": {
-        "compose-file": "docker/docker-compose.yaml",
-        "project-name": "dockermigrator"
+        "projects": [
+            {
+                "name": "dockermigrator",
+                "path": "docker"
+            }
+        ]
     }
 }
