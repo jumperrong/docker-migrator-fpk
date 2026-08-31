@@ -1,11 +1,16 @@
-# 飞牛 Docker 迁移工具（生产镜像，安装时由飞牛 appcenter 构建）
+# 飞牛 Docker 迁移工具 — 构建镜像
 #
-# 多架构兼容：x86_64 (AMD64) 和 ARM64 均可。
-# docker CLI + compose 插件：构建时按容器架构自动下载对应二进制。
-# Python 依赖：pip 在线安装，自动匹配容器架构的 wheel。
-# rsync / sshpass / openssh-client：apt 安装，走飞牛 debian 源。
+# 关键点：
+#   1. apt 源用清华镜像（默认 deb.debian.org 在国内 NAS 上经常超时/拒绝）
+#   2. 先改源再 apt-get update，避免 exit code 100
+#   3. docker CLI + compose 插件按架构自动选择
+#   4. pip 用清华 PyPI 镜像
 
 FROM python:3.11-slim
+
+# 换 Debian apt 源到清华镜像
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null || true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     rsync sshpass openssh-client ca-certificates curl \
@@ -31,9 +36,9 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# 在线安装 Python 依赖（pip 根据容器架构自动选择正确的 wheel）
+# pip 用清华源 + 在线安装
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY . .
 

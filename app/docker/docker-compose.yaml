@@ -3,7 +3,6 @@ name: dockermigrator
 services:
   dockermigrator:
     build: .
-    image: dockermigrator:latest
     container_name: dockermigrator
     restart: unless-stopped
     networks:
