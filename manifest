@@ -8,7 +8,6 @@ maintainer            = DIY
 distributor           = DIY
 service_port          = 8080
 checkport             = true
-os_min_version        = 0.9.27
 desktop_uidir         = ui
 desktop_applaunchname = dockermigrator.main
 ctl_stop              = true
