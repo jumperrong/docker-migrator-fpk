@@ -1,7 +1,6 @@
 #!/bin/bash
-# 安装后钩子（飞牛已 compose up + checkport 检查后调用）。
-log() { echo "[$(date '+%F_%T')] [install] $*"; }
-log "Docker 迁移工具安装完成。"
-log "访问 http://<NAS-IP>:${TRIM_SERVICE_PORT:-8080}/ 打开 WebUI。"
-log "目标 Docker 根目录: ${wizard_docker_root:-/vol1/1000/docker}"
+
+### Dockermigrator lifecycle script.
+### fnOS appcenter handles docker compose up/down automatically.
+
 exit 0

@@ -1,6 +1,6 @@
 #!/bin/bash
-# 卸载后钩子：清理构建的镜像；迁移到目标根目录的项目数据保留。
-log() { echo "[$(date '+%F_%T')] [uninstall] $*"; }
-docker rmi dockermigrator:latest >/dev/null 2>&1 || true
-log "Docker 迁移工具已卸载。已迁移的项目数据保留在 ${wizard_docker_root:-目标目录}。"
+
+### Dockermigrator lifecycle script.
+### fnOS appcenter handles docker compose up/down automatically.
+
 exit 0

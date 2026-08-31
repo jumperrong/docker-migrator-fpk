@@ -1,5 +1,6 @@
 #!/bin/bash
-# 升级前钩子：停旧容器（appcenter 通常已处理）。
-COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
-docker compose -f "$COMPOSE_FILE" -p dockermigrator down >/dev/null 2>&1 || true
+
+### Dockermigrator lifecycle script.
+### fnOS appcenter handles docker compose up/down automatically.
+
 exit 0

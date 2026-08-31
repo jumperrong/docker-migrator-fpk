@@ -1,3 +1,6 @@
 #!/bin/bash
-# 配置前钩子（本应用未提供飞牛设置页，留空）。
+
+### Dockermigrator lifecycle script.
+### fnOS appcenter handles docker compose up/down automatically.
+
 exit 0

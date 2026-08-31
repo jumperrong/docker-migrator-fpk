@@ -1,3 +1,6 @@
 #!/bin/bash
-# 配置后钩子（本应用配置在 WebUI 内完成，此处留空）。
+
+### Dockermigrator lifecycle script.
+### fnOS appcenter handles docker compose up/down automatically.
+
 exit 0
