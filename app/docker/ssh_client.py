@@ -4,9 +4,28 @@
 推模式：连接目标 NAS，推送本机 compose 后由 migrator 远程 compose up。
 """
 import os
+import time
 import shlex
+import socket
 import subprocess
 import paramiko
+
+
+# 瞬时错误关键词：这类错误重试一次往往就能成功（网络抖动、对端 sshd 短暂不响应 banner）
+_TRANSIENT_MARKERS = (
+    "banner", "Error reading SSH protocol banner",
+    "Connection reset", "Connection refused",
+    "timed out", "EOF", "Socket is closed",
+)
+
+
+def _is_transient(exc):
+    """判断异常是否为可重试的瞬时错误。"""
+    if isinstance(exc, (socket.timeout, ConnectionResetError, ConnectionAbortedError,
+                        paramiko.SSHException)):
+        msg = str(exc).lower()
+        return any(m.lower() in msg for m in _TRANSIENT_MARKERS)
+    return False
 
 
 class SSHClient:
@@ -18,7 +37,7 @@ class SSHClient:
         self.key_path = key_path
 
     # ---------- 连接 ----------
-    def _connect(self):
+    def _connect_once(self):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs = dict(
@@ -26,6 +45,8 @@ class SSHClient:
             port=self.port,
             username=self.username,
             timeout=15,
+            banner_timeout=20,   # 读取 SSH banner超时，避免卡死在 banner 阶段
+            auth_timeout=20,    # 认证阶段超时
             allow_agent=False,
             look_for_keys=False,
         )
@@ -39,6 +60,20 @@ class SSHClient:
             kwargs["look_for_keys"] = True
         client.connect(**kwargs)
         return client
+
+    def _connect(self):
+        """建立 SSH 连接，瞬时错误自动重试 1 次（间隔 2s）。"""
+        last_exc = None
+        for attempt in (1, 2):
+            try:
+                return self._connect_once()
+            except Exception as e:
+                last_exc = e
+                if attempt == 1 and _is_transient(e):
+                    time.sleep(2)
+                    continue
+                raise
+        raise last_exc  # 不会执行到这里，保留兜底
 
     def test_connection(self):
         """尝试连接并执行 uname，返回主机信息或失败。"""

@@ -24,6 +24,9 @@ services:
       - TZ=Asia/Shanghai
       - LOCAL_DOCKER_ROOT=${wizard_docker_root:-/vol1/1000/docker}
       - SOURCE_MOUNT=${wizard_source_mount:-}
+      # WebUI Basic Auth（默认 admin/admin，如需修改在 compose env 覆盖）
+      - MIGRATOR_WEB_USER=${wizard_web_user:-admin}
+      - MIGRATOR_WEB_PASSWORD=${wizard_web_password:-admin}
 
 networks:
   trim-default:

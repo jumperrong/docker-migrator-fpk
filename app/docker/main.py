@@ -4,19 +4,25 @@
 - 推模式（push）：本应用部署在「源 NAS」，扫描本机项目并推送到对端。
 - 本地映射模式（local）：源 NAS 硬盘阵列已物理挂载到本机，直接扫描挂载点上的项目，
   无需 SSH / rsync 网络传输，仅拷贝 compose + .env 到 staging 后在本地 build/pull/up。
+
+安全：Basic Auth 保护所有 /api/* 路由；路径遍历校验；SSH host/port 格式校验。
 """
 import os
 import json
 import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
 from ssh_client import SSHClient
 from migrator import Migrator
+from auth import (
+    validate_abs_path, validate_host, validate_port, validate_proj_name,
+    check_basic_auth, mask_secrets_in_text,
+)
 
 app = FastAPI(title="飞牛 Docker 迁移工具（通用版）")
 
@@ -24,10 +30,26 @@ BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 migrator = Migrator()
-# state: {'remote': {host/port/...}, 'mode': 'pull'|'push',
+# state: {'remote': {host/port/...}, 'mode': 'pull'|'push'|'local',
 #         'scan_root': str,  # 「扫描出项目」的根目录（拉=远端，推=本机）
 #         'remote_root': str # 「对端」docker root（推送时写 compose up 用）
 state = {"remote": None, "mode": "pull", "scan_root": "", "remote_root": ""}
+
+
+# ---------------- Basic Auth 中间件 ----------------
+@app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    """所有 /api/* 路由要求 Basic Auth；静态资源和首页放行。"""
+    path = request.url.path
+    if path.startswith("/api/"):
+        if not check_basic_auth(request):
+            return Response(
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Docker Migrator"'},
+                content='{"detail":"未认证，请使用 Basic Auth（默认 admin/admin）"}',
+                media_type="application/json",
+            )
+    return await call_next(request)
 
 
 # ---------------- 默认值（来自安装向导注入的 LOCAL_DOCKER_ROOT）----------------
@@ -86,6 +108,19 @@ async def index():
 
 @app.post("/api/connect")
 async def connect(cfg: ConnectionConfig):
+    # 输入校验（防 SSH 命令注入 + 路径遍历）
+    cfg.host = validate_host(cfg.host)
+    cfg.port = validate_port(cfg.port)
+    cfg.username = (cfg.username or "root").strip()[:32]
+    # username 只允许字母数字下划线横线点
+    import re
+    if not re.match(r"^[A-Za-z0-9_.\-]+$", cfg.username):
+        raise HTTPException(status_code=400, detail=f"用户名格式不合法: {cfg.username!r}")
+    if cfg.local_docker_root:
+        cfg.local_docker_root = validate_abs_path(cfg.local_docker_root, "本机 Docker 根目录")
+    if cfg.remote_docker_root:
+        cfg.remote_docker_root = validate_abs_path(cfg.remote_docker_root, "对端 Docker 根目录")
+
     # 兼容旧单字段 docker_root
     remote_root = cfg.remote_docker_root
     if cfg.docker_root and not remote_root:
@@ -141,21 +176,20 @@ async def list_projects():
 
 # ---------------- 本地映射模式：扫描挂载点（无需 SSH） ----------------
 # 权限错误 → 中文修复建议（覆盖容器挂载/uid-gid/NFS/目录权限）
+# 结构：[(关键词列表, 修复建议), ...]  — 一目了然，不再交替排列
 _PERMISSION_HINTS = [
-    ("容器内不可见挂载点",
+    (["容器内不可见挂载点", "no such file or directory", "not found", "不存在"],
      "💡 修复建议：路径在容器里不存在 → 该挂载路径未透传到 Docker 容器。"
      "在飞牛「停止应用」后编辑 docker-compose.yaml 的 volumes，"
      "或重新安装/配置挂载向导字段「源 NAS 挂载根路径」，然后重启应用。"
      "可在容器日志「启动诊断」章节查看已挂载清单。"),
-    ("EACCES", "Permission denied", "permission denied"),
-    ("💡 修复建议：Permission denied（EACCES）常见原因：① 源 NAS 硬盘挂载在本机使用了 UID/GID 映射（NFS all_squash / root_squash）"
+    (["EACCES", "Permission denied", "permission denied", "权限不够"],
+     "💡 修复建议：Permission denied（EACCES）常见原因：① 源 NAS 硬盘挂载在本机使用了 UID/GID 映射（NFS all_squash / root_squash）"
      "导致 root(容器内 uid=0) 无权读；② ext4/btrfs 挂载目录的 POSIX 权限不给 root 可读；"
      "建议：① 在飞牛主机侧执行 `ls -ld 路径` + `id`，对比容器日志启动诊断的 uid/gid；"
      "② NFS 改 /etc/exports 加 no_root_squash 或挂载时 anonuid=0; ③ U 盘/移动硬盘确保挂载时给用户/组可读权限。"),
-    ("EROFS", "read-only", "Read-only"),
-    ("💡 修复建议：文件系统只读（EROFS）。检查 mount 是否带 ro；USB 硬盘写保护开关；NTFS 可能只读需要 ntfs-3g。"),
-    ("ENOENT", "No such file", "not found"),
-    ("💡 修复建议：路径不存在（ENOENT）——容器内路径是否已随挂载点透传？「启动诊断」中对比已挂载卷与填写路径。"),
+    (["EROFS", "read-only", "Read-only", "只读"],
+     "💡 修复建议：文件系统只读（EROFS）。检查 mount 是否带 ro；USB 硬盘写保护开关；NTFS 可能只读需要 ntfs-3g。"),
 ]
 
 
@@ -163,18 +197,12 @@ def _diagnose_permission_error(err_str: str):
     """从错误字符串匹配权限类提示，返回首条命中的修复建议。"""
     if not err_str:
         return None
+    import re
     e = err_str.lower()
-    # 第一行是症状关键词，紧接下一行是修复建议；按顺序两条为一组
-    i = 0
-    while i + 1 < len(_PERMISSION_HINTS):
-        kws = _PERMISSION_HINTS[i]
-        suggestion = _PERMISSION_HINTS[i + 1]
-        if isinstance(kws, str):
-            kws = [kws]
+    for kws, hint in _PERMISSION_HINTS:
         for kw in kws:
-            if kw.lower() in e:
-                return suggestion
-        i += 2
+            if re.search(kw.lower(), e):
+                return hint
     return None
 
 
@@ -193,10 +221,8 @@ def _probe_local_path(root: str) -> str:
     msgs = []
     # 1) 路径存在
     if not os.path.exists(root):
-        return (
-            f"❌ 路径不存在：{root}\n"
-            + _PERMISSION_HINTS[7] if len(_PERMISSION_HINTS) > 7 else ""
-        )
+        hint = _diagnose_permission_error("no such file or directory") or ""
+        return f"❌ 路径不存在：{root}\n{hint}"
     if not os.path.isdir(root):
         return f"❌ 路径存在但不是目录：{root}"
     # 2) r+x
@@ -260,8 +286,7 @@ async def scan_local(root: str = ""):
     不需要 SSH 连接，直接用 list_local_projects 扫描本机路径。
     """
     root = (root or "").strip()
-    if not root:
-        raise HTTPException(status_code=400, detail="请填写源 NAS 挂载路径")
+    root = validate_abs_path(root, "源 NAS 挂载路径")
     # 权限探测
     diag = _probe_local_path(root)
     if diag and any(l.startswith("❌") for l in diag.splitlines()):
@@ -302,9 +327,23 @@ async def migrate(req: MigrateRequest):
     if req.direction != "local" and not state["remote"]:
         raise HTTPException(status_code=400, detail="请先连接对端 NAS")
 
+    # 路径校验（防遍历/注入）
+    req.local_docker_root = validate_abs_path(req.local_docker_root, "本机 Docker 根目录")
+    if req.remote_docker_root:
+        req.remote_docker_root = validate_abs_path(req.remote_docker_root, "对端 Docker 根目录")
+    if req.source_prefix:
+        req.source_prefix = validate_abs_path(req.source_prefix, "源 NAS 前缀")
+    if req.target_prefix:
+        req.target_prefix = validate_abs_path(req.target_prefix, "目标 NAS 前缀")
+    if req.direction == "local" and req.source_docker_data:
+        req.source_docker_data = validate_abs_path(req.source_docker_data, "源 docker data-root")
+    # 项目名校验（防 compose project name 命令注入）
+    for p in req.projects:
+        validate_proj_name(p.name)
+
     import uuid
     task_id = uuid.uuid4().hex
-    migrator.create_task(task_id)
+    migrator.create_task(task_id, direction=req.direction, project_count=len(req.projects))
     remote = state["remote"]
     projects = [p.model_dump() for p in req.projects]
 
@@ -323,6 +362,7 @@ async def migrate(req: MigrateRequest):
             source_docker_data=req.source_docker_data,
         )
     )
+    migrator._running_futures[task_id] = t  # 供 cancel_task 取消
 
     def _on_done(task: asyncio.Task):
         if task.cancelled():
@@ -370,7 +410,44 @@ async def get_task(task_id: str):
     if task_id not in migrator.tasks:
         raise HTTPException(status_code=404, detail="任务不存在")
     t = migrator.tasks[task_id]
-    return {"status": t["status"], "log_len": len(t["log"])}
+    return {
+        "status": t["status"],
+        "log_len": len(t["log"]),
+        "started_at": t.get("started_at", ""),
+        "direction": t.get("direction", ""),
+        "project_count": t.get("project_count", 0),
+        "historical": t.get("historical", False),
+    }
+
+
+@app.get("/api/tasks")
+async def list_tasks():
+    """列出所有历史任务（含进行中）。"""
+    return {"tasks": migrator.list_tasks()}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """取消正在运行的迁移任务。"""
+    if task_id not in migrator.tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    ok = migrator.cancel_task(task_id)
+    return {"ok": ok, "task_id": task_id}
+
+
+@app.get("/api/tasks/{task_id}/log")
+async def download_log(task_id: str):
+    """下载任务日志为 txt 文件。"""
+    if task_id not in migrator.tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    t = migrator.tasks[task_id]
+    lines = [f"[{e.get('stream','stdout')}] {e.get('line','')}" for e in t.get("log", [])]
+    content = f"=== Docker 迁移工具任务日志 ===\n任务ID: {task_id}\n状态: {t['status']}\n方向: {t.get('direction','')}\n开始时间: {t.get('started_at','')}\n\n" + "\n".join(lines)
+    return Response(
+        content=content,
+        media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename=migrator_{task_id[:8]}.log"}
+    )
 
 
 if __name__ == "__main__":

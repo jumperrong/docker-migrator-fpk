@@ -27,8 +27,77 @@ from ssh_client import SSHClient
 
 
 class Migrator:
+    # 日志环形缓冲上限（条），避免大迁移 OOM
+    MAX_LOG_ENTRIES = 5000
+    # 任务持久化文件
+    TASKS_FILE = os.path.join(tempfile.gettempdir(), "dockermigrator_tasks.json")
+
     def __init__(self):
-        self.tasks = {}  # task_id -> {status, log:[...]}
+        self.tasks = {}  # task_id -> {status, log:[...], future, project_names}
+        self._running_futures = {}  # task_id -> asyncio.Task
+        self._locks = {}  # project_name -> asyncio.Lock（同名 project 互斥）
+        self._global_lock = asyncio.Lock()  # 保护 self.tasks 字典
+        # 恢复持久化的任务历史（不含 future，仅展示）
+        self._load_tasks()
+
+    # ==========================================================================
+    # 任务持久化
+    # ==========================================================================
+    def _save_tasks(self):
+        """持久化任务状态到 JSON（不含 future/log 全量，仅摘要）。"""
+        try:
+            summary = []
+            for tid, t in self.tasks.items():
+                # 只保留最近 200 条日志用于持久化
+                recent_log = t.get("log", [])[-200:]
+                summary.append({
+                    "task_id": tid,
+                    "status": t.get("status", "unknown"),
+                    "log": recent_log,
+                    "started_at": t.get("started_at", ""),
+                    "direction": t.get("direction", ""),
+                    "project_count": t.get("project_count", 0),
+                })
+            with open(self.TASKS_FILE, "w", encoding="utf-8") as f:
+                json_dump = __import__("json").dumps(summary, ensure_ascii=False)
+                f.write(json_dump)
+        except Exception:
+            pass
+
+    def _load_tasks(self):
+        """启动时恢复历史任务（仅展示，不能继续操作）。"""
+        try:
+            with open(self.TASKS_FILE, "r", encoding="utf-8") as f:
+                summary = __import__("json").loads(f.read())
+            for item in summary:
+                tid = item.get("task_id")
+                if tid and tid not in self.tasks:
+                    self.tasks[tid] = {
+                        "status": item.get("status", "unknown"),
+                        "log": item.get("log", []),
+                        "started_at": item.get("started_at", ""),
+                        "direction": item.get("direction", ""),
+                        "project_count": item.get("project_count", 0),
+                        "historical": True,  # 标记为历史任务
+                    }
+        except Exception:
+            pass
+
+    def list_tasks(self):
+        """返回所有任务摘要（按时间倒序）。"""
+        result = []
+        for tid, t in self.tasks.items():
+            result.append({
+                "task_id": tid,
+                "status": t.get("status", "unknown"),
+                "log_len": len(t.get("log", [])),
+                "started_at": t.get("started_at", ""),
+                "direction": t.get("direction", ""),
+                "project_count": t.get("project_count", 0),
+                "historical": t.get("historical", False),
+            })
+        result.sort(key=lambda x: x["started_at"], reverse=True)
+        return result
 
     # ==========================================================================
     # Docker 常见错误 → 中文修复建议（保持原有）
@@ -136,14 +205,37 @@ class Migrator:
     # ==========================================================================
     # 任务状态
     # ==========================================================================
-    def create_task(self, task_id):
-        self.tasks[task_id] = {"status": "pending", "log": []}
+    def create_task(self, task_id, direction="", project_count=0):
+        import datetime
+        self.tasks[task_id] = {
+            "status": "pending", "log": [],
+            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "direction": direction, "project_count": project_count,
+            "secrets": [],  # 待打码的敏感字符串（如 SSH 密码）
+        }
+
+    def add_task_secrets(self, task_id, secrets):
+        """注册需打码的敏感字符串（如密码），日志输出时自动替换。"""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        for s in (secrets or []):
+            if s and s not in task["secrets"] and len(s) >= 3:
+                task["secrets"].append(s)
 
     def _log(self, task_id, line, stream="stdout"):
         task = self.tasks.get(task_id)
         if task is None:
             return
+        # 密码打码
+        secrets = task.get("secrets", [])
+        for s in secrets:
+            if s and len(s) >= 3 and s in str(line):
+                line = str(line).replace(s, s[:2] + "***")
         task["log"].append({"line": line, "stream": stream})
+        # 日志环形缓冲：超限时裁掉前半部分
+        if len(task["log"]) > self.MAX_LOG_ENTRIES:
+            task["log"] = task["log"][len(task["log"]) // 2:]
 
     # ==========================================================================
     # 执行本机子进程
@@ -256,17 +348,22 @@ class Migrator:
                                    attachable: bool, enable_ipv6: bool, subnets: list}}
         has_build:     bool                               # 任一 service 有 build
         build_contexts: set(str)                          # 相对路径 build context（相对 compose 文件所在目录）
+        env_files:     [(path, svc_name), ...]            # env_file 引用（绝对路径或相对路径）
+        has_secrets:   bool                               # 是否含 swarm secrets
+        has_configs:   bool                               # 是否含 swarm configs
         """
         with open(compose_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         if not isinstance(data, dict):
             return {"binds": [], "named_volumes": [], "volume_defs": {},
-                    "network_defs": {}, "has_build": False, "build_contexts": set()}
+                    "network_defs": {}, "has_build": False, "build_contexts": set(),
+                          "env_files": [], "has_secrets": False, "has_configs": False}
 
         binds = []
         named_volumes = []
         has_build = False
         build_contexts = set()
+        env_files = []
 
         for svc_name, svc in (data.get("services") or {}).items():
             # ---- volumes ----
@@ -289,7 +386,6 @@ class Migrator:
                         if isinstance(src, str) and not src.startswith("/"):
                             named_volumes.append((src, svc_name))
                         elif isinstance(target, str) and target.startswith("/"):
-                            # 无 name 的 named volume 用 target 的哈希？不可能无 name 但有 target
                             pass
 
             # ---- build ----
@@ -303,6 +399,18 @@ class Migrator:
                 else:
                     ctx = "."
                 build_contexts.add(ctx)
+
+            # ---- env_file ----
+            ef = svc.get("env_file")
+            if ef:
+                if isinstance(ef, str):
+                    env_files.append((ef, svc_name))
+                elif isinstance(ef, list):
+                    for f in ef:
+                        if isinstance(f, str):
+                            env_files.append((f, svc_name))
+                        elif isinstance(f, dict) and f.get("path"):
+                            env_files.append((f["path"], svc_name))
 
         # ---- top-level volumes ----
         volume_defs = {}
@@ -326,6 +434,10 @@ class Migrator:
                 "enable_ipv6": bool(ndef.get("enable_ipv6", False)),
             }
 
+        # ---- swarm secrets/configs（仅检测，不迁移）----
+        has_secrets = bool(data.get("secrets"))
+        has_configs = bool(data.get("configs"))
+
         return {
             "binds": binds,
             "named_volumes": named_volumes,
@@ -333,7 +445,71 @@ class Migrator:
             "network_defs": network_defs,
             "has_build": has_build,
             "build_contexts": build_contexts,
+            "env_files": env_files,
+            "has_secrets": has_secrets,
+            "has_configs": has_configs,
         }
+
+    async def _check_container_conflicts(self, task_id, name, compose_path, remote=None):
+        """检测目标 NAS 是否已有同名容器/网络/compose project，避免冲突。"""
+        try:
+            import yaml as _yml
+            with open(compose_path, "r", encoding="utf-8") as f:
+                data = _yml.safe_load(f) or {}
+            svc_names = []
+            container_names = []
+            for svc_name, svc in (data.get("services") or {}).items():
+                svc_names.append(svc_name)
+                cn = svc.get("container_name")
+                if cn:
+                    container_names.append(cn)
+            # 检测已有容器
+            for cn in container_names:
+                check_cmd = ["docker", "ps", "-a", "--filter", f"name=^{cn}$", "--format", "{{.Names}}"]
+                if remote:
+                    out = await self._run_remote_cmd(task_id, remote, check_cmd, warn_only=True)
+                else:
+                    out = await self._run_cmd(task_id, check_cmd, warn_only=True)
+                if out and out.strip():
+                    self._log(task_id,
+                              f"⚠️ 目标 NAS 已存在容器 {cn} — compose up 将复用或重建。"
+                              f"如需干净迁移，先 docker rm -f {cn}",
+                              "stderr")
+        except Exception as e:
+            self._log(task_id, f"⚠️ 容器冲突检测失败 {name}: {e}（继续）", "stderr")
+
+    def _warn_compose_caveats(self, task_id, parsed, name):
+        """对 compose 解析结果输出 external/secrets/configs/env_file 警告。"""
+        # external volumes
+        for vn, vd in (parsed.get("volume_defs") or {}).items():
+            if vd.get("external"):
+                self._log(task_id,
+                          f"⚠️ volume {vn} 声明为 external — 需在目标 NAS 手动创建同名 volume，"
+                          f"否则 {name} 启动会失败",
+                          "stderr")
+        # external networks
+        for nn, nd in (parsed.get("network_defs") or {}).items():
+            if nd.get("external"):
+                self._log(task_id,
+                          f"⚠️ network {nn} 声明为 external — 需在目标 NAS 手动创建同名 network",
+                          "stderr")
+        # swarm secrets/configs
+        if parsed.get("has_secrets"):
+            self._log(task_id,
+                      "⚠️ compose 含 secrets（Docker Swarm 特性）— 飞牛 compose v2 不支持，"
+                      "迁移后如启动失败请删除 secrets 段或改用 bind mount 挂载密钥文件",
+                      "stderr")
+        if parsed.get("has_configs"):
+            self._log(task_id,
+                      "⚠️ compose 含 configs（Docker Swarm 特性）— 飞牛 compose v2 不支持，"
+                      "迁移后如启动失败请删除 configs 段或改用 bind mount",
+                      "stderr")
+        # env_file 引用
+        env_files = parsed.get("env_files") or []
+        if env_files:
+            paths = [ef[0] for ef in env_files]
+            self._log(task_id, f"  发现 env_file 引用: {paths}（相对路径在项目目录内的会随 rsync 一起迁移；"
+                               f"绝对路径指向项目外的需确认目标 NAS 同路径存在）")
 
     # ==========================================================================
     # compose 重写 — bind 路径前缀映射
@@ -613,14 +789,50 @@ class Migrator:
     # ==========================================================================
     # 统一入口
     # ==========================================================================
+    def cancel_task(self, task_id):
+        """取消正在运行的迁移任务。返回是否成功取消。"""
+        future = self._running_futures.get(task_id)
+        if future and not future.done():
+            future.cancel()
+            self._log(task_id, "⚠️ 任务已被用户取消", "stderr")
+            return True
+        return False
+
+    async def _check_disk_space(self, task_id, path, min_gb=1):
+        """迁移前磁盘空间预检：检查目标路径所在文件系统可用空间。"""
+        try:
+            st = os.statvfs(path)
+            avail_bytes = st.f_bavail * st.f_frsize
+            avail_gb = avail_bytes / (1024 ** 3)
+            self._log(task_id, f"  磁盘预检：{path} 可用空间 {avail_gb:.1f} GB")
+            if avail_gb < min_gb:
+                self._log(task_id,
+                          f"⚠️ 可用空间仅 {avail_gb:.1f} GB < {min_gb} GB，迁移可能中途磁盘满！"
+                          "建议先 docker system prune 或换大容量卷",
+                          "stderr")
+            return avail_gb >= min_gb
+        except Exception as e:
+            self._log(task_id, f"⚠️ 磁盘预检失败 {path}: {e}（继续）", "stderr")
+            return True
+
     async def run(self, task_id, direction, remote, local_docker_root, remote_docker_root,
                   projects, pull_images=True, start_containers=True,
                   source_prefix="", target_prefix="", source_docker_data=""):
         task = self.tasks[task_id]
         task["status"] = "running"
+        task["direction"] = direction
+        task["project_count"] = len(projects)
+
+        # 注册需打码的敏感信息
+        if remote and remote.get("password"):
+            self.add_task_secrets(task_id, [remote["password"]])
 
         prefix_active = bool(source_prefix) and source_prefix != target_prefix
         try:
+            # 磁盘空间预检（本地目标根目录）
+            if local_docker_root and os.path.isdir(local_docker_root):
+                await self._check_disk_space(task_id, local_docker_root, min_gb=1)
+
             if direction == "pull":
                 self._log(task_id, f"[拉模式] 开始迁移 {len(projects)} 个项目（从源 NAS → 本机）")
                 await self._run_pull(task_id, remote, local_docker_root, projects,
@@ -640,10 +852,17 @@ class Migrator:
 
             task["status"] = "done"
             self._log(task_id, "\n===== 全部迁移完成 =====")
+        except asyncio.CancelledError:
+            task["status"] = "cancelled"
+            self._log(task_id, "⚠️ 任务已取消", "stderr")
+            raise
         except Exception as e:
             task["status"] = "error"
             self._log(task_id, f"错误: {e}", "stderr")
             raise
+        finally:
+            self._save_tasks()
+            self._running_futures.pop(task_id, None)
 
     # ==========================================================================
     # 拉模式 — 目标 NAS 部署
@@ -660,8 +879,10 @@ class Migrator:
 
         remote_user = remote["username"]
         remote_host = remote["host"]
-
-        for idx, proj in enumerate(projects, 1):
+        tmp_workdir = tempfile.mkdtemp(prefix="migpull_")
+        self._log(task_id, f"（临时 staging 目录：{tmp_workdir}）")
+        try:
+          for idx, proj in enumerate(projects, 1):
             name = proj["name"]
             remote_path = proj.get("remote_path") or f"(missing remote_path for {name})"
             compose_name = proj.get("compose_file", "docker-compose.yml")
@@ -690,7 +911,8 @@ class Migrator:
             except Exception as e:
                 self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
                 parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
-                          "network_defs": {}, "has_build": False, "build_contexts": set()}
+                          "network_defs": {}, "has_build": False, "build_contexts": set(),
+                          "env_files": [], "has_secrets": False, "has_configs": False}
 
             binds = parsed["binds"]
             named_vols = parsed["named_volumes"]
@@ -701,6 +923,7 @@ class Migrator:
 
             if build_contexts:
                 self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}")
+            self._warn_compose_caveats(task_id, parsed, name)
 
             # ---- 4) bind mount 同步（排除项目目录内部的）----
             rp_norm = os.path.normpath(remote_path)
@@ -786,6 +1009,8 @@ class Migrator:
 
             # ---- 8) compose build / pull / up ----
             compose_ctx = ["docker", "compose", "-f", compose_file, "-p", name]
+            # 容器名冲突预检
+            await self._check_container_conflicts(task_id, name, compose_file)
             if has_build:
                 self._log(task_id, "  检测到 build 指令，先 compose build")
                 try:
@@ -803,6 +1028,8 @@ class Migrator:
                                     label=f"docker compose up {name}")
 
             self._log(task_id, f"✅ 项目 {name} 完成")
+        finally:
+            shutil.rmtree(tmp_workdir, ignore_errors=True)
 
     # ==========================================================================
     # 推模式 — 源 NAS 部署
@@ -861,7 +1088,8 @@ class Migrator:
                 except Exception as e:
                     self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
                     parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
-                              "network_defs": {}, "has_build": False, "build_contexts": set()}
+                              "network_defs": {}, "has_build": False, "build_contexts": set(),
+                          "env_files": [], "has_secrets": False, "has_configs": False}
 
                 binds = parsed["binds"]
                 named_vols = parsed["named_volumes"]
@@ -872,6 +1100,7 @@ class Migrator:
 
                 if build_contexts:
                     self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}（已随 staging 一起同步）")
+                self._warn_compose_caveats(task_id, parsed, name)
 
                 # ---- 3) 重写 staging compose（bind 路径）----
                 if prefix_active:
@@ -958,6 +1187,8 @@ class Migrator:
                 # ---- 8) 远端 compose build / pull / up ----
                 remote_compose_path = os.path.join(remote_dst, compose_name)
                 compose_ctx = ["docker", "compose", "-f", remote_compose_path, "-p", name]
+                # 容器名冲突预检（远端）
+                await self._check_container_conflicts(task_id, name, remote_compose_path, remote=remote)
                 if has_build:
                     self._log(task_id, "  远端检测到 build 指令，先 compose build")
                     try:
@@ -1078,7 +1309,8 @@ class Migrator:
                 except Exception as e:
                     self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
                     parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
-                              "network_defs": {}, "has_build": False, "build_contexts": set()}
+                              "network_defs": {}, "has_build": False, "build_contexts": set(),
+                          "env_files": [], "has_secrets": False, "has_configs": False}
 
                 binds = parsed["binds"]
                 named_vols = parsed["named_volumes"]
@@ -1089,6 +1321,7 @@ class Migrator:
 
                 if build_contexts:
                     self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}")
+                self._warn_compose_caveats(task_id, parsed, name)
 
                 # ---- 4) 重写 staging compose ----
                 # a. bind 路径前缀映射
@@ -1146,6 +1379,8 @@ class Migrator:
 
                 # ---- 7) compose build / pull / up ----
                 compose_ctx = ["docker", "compose", "-f", staging_compose, "-p", name]
+                # 容器名冲突预检（本地）
+                await self._check_container_conflicts(task_id, name, staging_compose)
                 if has_build:
                     self._log(task_id, "  检测到 build 指令，先 compose build")
                     try:

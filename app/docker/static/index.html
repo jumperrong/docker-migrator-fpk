@@ -205,6 +205,8 @@
     </details>
     <div class="row">
       <button id="btnMigrate" onclick="migrate()" disabled>开始迁移</button>
+      <button id="btnCancel" onclick="cancelMigrate()" disabled class="ghost">取消任务</button>
+      <button id="btnDownloadLog" onclick="downloadLog()" disabled class="ghost">下载日志</button>
       <span id="migStatus" class="status muted"></span>
     </div>
   </section>
@@ -212,7 +214,49 @@
   <!-- 4. 日志 -->
   <section class="card">
     <h2>迁移日志</h2>
+    <div id="progressBar" style="display:none;margin:0 0 10px;height:6px;background:var(--code-bg);border-radius:3px;overflow:hidden">
+      <div id="progressFill" style="height:100%;width:0;background:var(--accent);transition:width .3s"></div>
+    </div>
     <pre id="log" class="log"></pre>
+  </section>
+
+  <!-- 5. 帮助 / FAQ -->
+  <section class="card">
+    <h2>帮助 / FAQ</h2>
+    <details>
+      <summary>三种迁移模式怎么选？</summary>
+      <p class="muted" style="font-size:13px;margin:8px 0">
+        ① <b>拉模式</b>：本应用装在目标 NAS，SSH 连源 NAS 拉取。最常用。<br>
+        ② <b>推模式</b>：本应用装在源 NAS，SSH 连目标 NAS 推送。<br>
+        ③ <b>本地映射模式</b>：源 NAS 硬盘已物理挂载到本机（USB/eSATA/NFS），零网络传输，最快。
+      </p>
+    </details>
+    <details>
+      <summary>迁移包含哪些内容？</summary>
+      <p class="muted" style="font-size:13px;margin:8px 0">
+        docker-compose.yml + .env + 外部 bind mount 路径 + named volume 数据 + 自定义网络 + build context + 镜像（pull 或 build）。
+        <b>不迁移</b>：external volume/network（需手动在目标创建）、Swarm secrets/configs（飞牛 compose v2 不支持）。
+      </p>
+    </details>
+    <details>
+      <summary>Permission denied 怎么办？</summary>
+      <p class="muted" style="font-size:13px;margin:8px 0">
+        ① 检查容器日志「启动诊断」中的 uid/gid 和挂载卷清单；② NFS 加 no_root_squash；③ ext4/USB chmod o+rX；
+        ④ compose.yaml 配置 user: '0:0'；⑤ 本地映射模式确认挂载点已透传到容器（compose volumes）。
+      </p>
+    </details>
+    <details>
+      <summary>WebUI 默认密码？</summary>
+      <p class="muted" style="font-size:13px;margin:8px 0">
+        默认 admin/admin。修改方式：停止应用 → 编辑 docker-compose.yaml 的 MIGRATOR_WEB_USER / MIGRATOR_WEB_PASSWORD 环境变量 → 重启。
+      </p>
+    </details>
+    <details>
+      <summary>任务历史与日志下载</summary>
+      <p class="muted" style="font-size:13px;margin:8px 0">
+        任务状态自动持久化（容器重启不丢失历史）。点击「下载日志」可导出当前任务完整日志 .log 文件，方便求助。
+      </p>
+    </details>
   </section>
 </div>
 
@@ -428,8 +472,15 @@ async function migrate() {
   }
 }
 
+let currentTaskId = null;
+
 function streamLog(taskId) {
+  currentTaskId = taskId;
   if (es) es.close();
+  $('btnCancel').disabled = false;
+  $('btnDownloadLog').disabled = false;
+  $('progressBar').style.display = '';
+  $('progressFill').style.width = '0';
   es = new EventSource(`/api/tasks/${taskId}/stream`);
   es.onmessage = (ev) => {
     const d = JSON.parse(ev.data);
@@ -439,16 +490,53 @@ function streamLog(taskId) {
       else if (d.line.startsWith('$ ')) cls = 'cmd';
       if (typeof d.line === 'string' && d.line.startsWith('💡')) cls = 'hint';
       appendLog(d.line, cls);
+      // 进度解析：匹配 [idx/total] 格式
+      const m = String(d.line).match(/\[(\d+)\/(\d+)\]/);
+      if (m) {
+        const pct = Math.round((parseInt(m[1]) - 1 + 0.5) / parseInt(m[2]) * 100);
+        $('progressFill').style.width = pct + '%';
+      }
     }
     if (d.status === 'done') {
       setMig('迁移完成 ✓', 'ok');
-      es.close(); es=null; $('btnMigrate').disabled = false;
+      $('progressFill').style.width = '100%';
+      es.close(); es=null;
+      $('btnMigrate').disabled = false;
+      $('btnCancel').disabled = true;
     } else if (d.status === 'error') {
       setMig('迁移出错（见日志）', 'err');
-      es.close(); es=null; $('btnMigrate').disabled = false;
+      es.close(); es=null;
+      $('btnMigrate').disabled = false;
+      $('btnCancel').disabled = true;
+    } else if (d.status === 'cancelled') {
+      setMig('任务已取消', 'muted');
+      es.close(); es=null;
+      $('btnMigrate').disabled = false;
+      $('btnCancel').disabled = true;
     }
   };
   es.onerror = () => { setMig('日志连接中断', 'err'); };
+}
+
+async function cancelMigrate() {
+  if (!currentTaskId) return;
+  if (!confirm('确定取消当前迁移任务？')) return;
+  try {
+    const r = await fetch(`/api/tasks/${currentTaskId}/cancel`, {method:'POST'});
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      setMig('取消请求已发送…', 'muted');
+    } else {
+      setMig('取消失败：' + (d.detail || '任务可能已结束'), 'err');
+    }
+  } catch (e) {
+    setMig('取消失败：' + e, 'err');
+  }
+}
+
+function downloadLog() {
+  if (!currentTaskId) return;
+  window.open(`/api/tasks/${currentTaskId}/log`, '_blank');
 }
 
 function setMig(text, cls) {

@@ -42,6 +42,30 @@
                 "rules": [
                     { "pattern": "^$|^/[A-Za-z0-9_.\\-][A-Za-z0-9_./\\-]*$", "message": "若填写，必须是绝对路径，例如 /mnt/oldnas" }
                 ]
+            },
+            {
+                "type": "tips",
+                "helpText": "<b>WebUI 访问认证（选填）：</b>本工具 WebUI 使用 Basic Auth 保护。默认账号 <code>admin / admin</code>（飞牛内网弱认证）。如需自定义，请在下方填写用户名和密码；留空则使用默认 admin/admin。安装后如需修改，停止应用后编辑 <code>docker-compose.yaml</code> 的 environment 再启动。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_web_user",
+                "label": "WebUI 用户名（选填）",
+                "initValue": "admin",
+                "description": "WebUI Basic Auth 用户名，留空使用默认 admin。",
+                "rules": [
+                    { "pattern": "^$|^[A-Za-z0-9_][A-Za-z0-9_.\\-]{0,31}$", "message": "用户名须以字母/数字/下划线开头，仅含字母数字下划线点横线，最长 32 字符" }
+                ]
+            },
+            {
+                "type": "password",
+                "field": "wizard_web_password",
+                "label": "WebUI 密码（选填）",
+                "initValue": "admin",
+                "description": "WebUI Basic Auth 密码，留空使用默认 admin。建议设置为强口令。",
+                "rules": [
+                    { "min": 3, "message": "密码至少 3 位" }
+                ]
             }
         ]
     }
