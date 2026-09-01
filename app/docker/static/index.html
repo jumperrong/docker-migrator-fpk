@@ -113,25 +113,41 @@
         <b>部署在目标 NAS</b>（从源 NAS 拉取，目标 NAS 拉模式）</label>
       <label><input type="radio" name="mode" value="push" onchange="onModeChange()">
         <b>部署在源 NAS</b>（推送到目标 NAS，源 NAS 推模式）</label>
+      <label><input type="radio" name="mode" value="local" onchange="onModeChange()">
+        <b>本地映射模式</b>（源 NAS 硬盘已挂载到本机，零网络传输）</label>
     </div>
     <p class="muted" id="modeHint" style="font-size:12px;margin:6px 0 0">
       拉模式推荐：只需要目标 NAS 能 SSH 到源 NAS。<br>
-      推模式适用：源 NAS 能外连、目标 NAS 在另一侧网络。
+      推模式适用：源 NAS 能外连、目标 NAS 在另一侧网络。<br>
+      本地映射模式：源 NAS 硬盘阵列已物理挂载到本机（如 USB/eSATA/NFS 挂载），无需 SSH 与 rsync 网络传输，最快。
     </p>
   </section>
 
-  <!-- 1. 连接对端 NAS -->
+  <!-- 1. 连接对端 NAS / 扫描挂载路径 -->
   <section class="card">
-    <h2>1. 连接<span id="dirConn" class="dir-badge">源 NAS</span></h2>
-    <div class="grid">
-      <label class="field"><span>主机 IP</span><input type="text" id="host" placeholder="192.168.1.100"></label>
-      <label class="field"><span>SSH 端口</span><input type="number" id="port" value="22"></label>
-      <label class="field"><span>用户名</span><input type="text" id="username" value="root"></label>
-      <label class="field"><span>密码</span><input type="password" id="password"></label>
+    <h2 id="step1Title">1. 连接<span id="dirConn" class="dir-badge">源 NAS</span></h2>
+    <!-- SSH 模式专用字段（pull / push） -->
+    <div id="sshFields">
+      <div class="grid">
+        <label class="field"><span>主机 IP</span><input type="text" id="host" placeholder="192.168.1.100"></label>
+        <label class="field"><span>SSH 端口</span><input type="number" id="port" value="22"></label>
+        <label class="field"><span>用户名</span><input type="text" id="username" value="root"></label>
+        <label class="field"><span>密码</span><input type="password" id="password"></label>
+      </div>
+      <label class="field" style="margin-bottom:12px"><span id="remoteRootLabel">对端 NAS 上 Docker 项目根目录</span>
+        <input type="text" id="remoteRoot" class="full" value="/vol1/1000/docker">
+      </label>
     </div>
-    <label class="field" style="margin-bottom:12px"><span id="remoteRootLabel">对端 NAS 上 Docker 项目根目录</span>
-      <input type="text" id="remoteRoot" class="full" value="/vol1/1000/docker">
-    </label>
+    <!-- 本地映射模式专用字段 -->
+    <div id="localFields" style="display:none">
+      <label class="field" style="margin-bottom:12px"><span>源 NAS 挂载路径（Docker 项目根目录在本机的挂载点）</span>
+        <input type="text" id="mountPath" class="full" placeholder="/mnt/oldnas/vol1/1000/docker" value="">
+      </label>
+      <p class="muted" style="font-size:12px;margin:-4px 0 12px">
+        填写源 NAS 硬盘挂载到本机的路径下 Docker 项目根目录，例如 <code>/mnt/oldnas/vol1/1000/docker</code>。
+        无需 SSH / 密码，直接扫描该路径下的 compose 项目。
+      </p>
+    </div>
     <div class="row">
       <button id="btnConnect" onclick="connect()">连接并扫描</button>
       <span id="connStatus" class="status muted"></span>
@@ -163,7 +179,7 @@
       <label><input type="checkbox" id="startContainers" checked> 启动容器</label>
     </div>
     <details>
-      <summary>高级：路径前缀映射（两台 NAS 路径不同时必填）</summary>
+      <summary>高级：路径前缀映射 + 源 docker data-root（本地映射模式可选）</summary>
       <p class="muted" style="font-size:12px;margin:8px 0">
         例如源 NAS 为 <code>/vol1/1000</code>、目标 NAS 为 <code>/vol2/1000</code>，填入下方。
         迁移时会自动同步 compose 里以源前缀开头的外部 bind mount 路径，并把 compose 路径改写到目标前缀。
@@ -176,7 +192,14 @@
         <label class="field"><span id="tpLabel">目标 NAS 前缀</span>
           <input type="text" id="targetPrefix" placeholder="/vol2/1000">
         </label>
+        <label class="field" id="sourceDockerDataWrap"><span>源 docker data-root 路径（仅本地映射模式）</span>
+          <input type="text" id="sourceDockerData" placeholder="/mnt/oldnas/var/lib/docker">
+        </label>
       </div>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">
+        「源 docker data-root 路径」仅<b>本地映射模式</b>用：填源 NAS 的 <code>/var/lib/docker</code> 在本机挂载点上的路径，
+        用于把 named volume 数据从挂载点复制到本机 docker。留空则 named volume 创建为空。
+      </p>
     </details>
     <div class="row">
       <button id="btnMigrate" onclick="migrate()" disabled>开始迁移</button>
@@ -215,7 +238,9 @@ function onModeChange() {
   mode = document.querySelector('input[name="mode"]:checked').value;
   const conn = $('dirConn'), header = $('headerSub'),
         remoteLabel = $('remoteRootLabel'), thPath = $('thPath'),
-        localLabel = $('localRootLabel'), sp = $('spLabel'), tp = $('tpLabel');
+        localLabel = $('localRootLabel'), sp = $('spLabel'), tp = $('tpLabel'),
+        sshBox = $('sshFields'), localBox = $('localFields'),
+        btn = $('btnConnect'), step1 = $('step1Title');
   if (mode === 'pull') {
     conn.textContent = '源 NAS';
     header.innerHTML = '本工具部署在<strong>目标 NAS</strong>上，通过 SSH 连接源 NAS，用 rsync 拉取 Docker 项目并在本机启动。';
@@ -224,7 +249,11 @@ function onModeChange() {
     localLabel.textContent = '本机（目标 NAS）Docker 项目根目录（需与容器挂载路径一致）';
     sp.textContent = '源 NAS 前缀';
     tp.textContent = '目标 NAS（本机）前缀';
-  } else {
+    sshBox.style.display = '';
+    localBox.style.display = 'none';
+    step1.innerHTML = '1. 连接<span id="dirConn" class="dir-badge">源 NAS</span>';
+    btn.textContent = '连接并扫描';
+  } else if (mode === 'push') {
     conn.textContent = '目标 NAS';
     header.innerHTML = '本工具部署在<strong>源 NAS</strong>上，通过 SSH 连接目标 NAS，把本机 Docker 项目用 rsync 推送到对端并在对端启动。';
     remoteLabel.textContent = '目标 NAS 上 Docker 项目根目录';
@@ -232,7 +261,27 @@ function onModeChange() {
     localLabel.textContent = '本机（源 NAS）Docker 项目根目录（需与容器挂载路径一致）';
     sp.textContent = '源 NAS（本机）前缀';
     tp.textContent = '目标 NAS 前缀';
+    sshBox.style.display = '';
+    localBox.style.display = 'none';
+    step1.innerHTML = '1. 连接<span id="dirConn" class="dir-badge">目标 NAS</span>';
+    btn.textContent = '连接并扫描';
+  } else { // local
+    header.innerHTML = '<strong>本地映射模式</strong>：源 NAS 硬盘阵列已物理挂载到本机，直接扫描挂载点上的 Docker 项目，'
+      + '无需 SSH / rsync 网络传输，仅拷贝 compose + .env 后在本地 build/pull/up。';
+    thPath.textContent = '源路径（挂载点）';
+    localLabel.textContent = '本机 Docker 项目根目录（迁移后容器运行目录，需与容器挂载路径一致）';
+    sp.textContent = '源 NAS 挂载点前缀';
+    tp.textContent = '本机前缀';
+    sshBox.style.display = 'none';
+    localBox.style.display = '';
+    step1.innerHTML = '1. 扫描<span class="dir-badge">源 NAS 挂载路径</span>';
+    btn.textContent = '扫描挂载路径';
   }
+  // 切换模式后清空已扫描项目
+  projects = [];
+  renderProjects();
+  $('btnMigrate').disabled = true;
+  setConn('');
 }
 
 function setConn(text, cls) {
@@ -241,26 +290,40 @@ function setConn(text, cls) {
 }
 
 async function connect() {
-  const body = {
-    host: $('host').value.trim(),
-    port: parseInt($('port').value) || 22,
-    username: $('username').value.trim(),
-    password: $('password').value,
-    // 「拉模式」：扫描远端（源 NAS）的项目
-    // 「推模式」：扫描本机（源 NAS）的项目，然后连接到远端（目标 NAS）验证 ssh 可达
-    scan_local: (mode === 'push'),
-    local_docker_root: $('localRoot').value.trim(),
-    remote_docker_root: $('remoteRoot').value.trim(),
-  };
-  if (!body.host) { setConn('请填写对端主机 IP', 'err'); return; }
   $('btnConnect').disabled = true;
-  setConn('连接中…');
+  setConn('扫描中…');
   try {
-    const r = await fetch('/api/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    const data = await r.json();
-    if (!r.ok) { setConn('连接失败：' + (data.detail||''), 'err'); $('btnConnect').disabled=false; return; }
-    setConn(mode === 'pull' ? '已连接源 NAS ✓' : '已连接目标 NAS + 扫描本机 ✓', 'ok');
-    await loadProjects();
+    if (mode === 'local') {
+      // 本地映射模式：无需 SSH，直接扫描挂载路径
+      const mountPath = $('mountPath').value.trim();
+      if (!mountPath) { setConn('请填写源 NAS 挂载路径', 'err'); $('btnConnect').disabled=false; return; }
+      const r = await fetch(`/api/scan_local?root=${encodeURIComponent(mountPath)}`);
+      const data = await r.json();
+      if (!r.ok) { setConn('扫描失败：' + (data.detail||''), 'err'); $('btnConnect').disabled=false; return; }
+      projects = data.projects || [];
+      renderProjects();
+      $('scanInfo').textContent = `共 ${projects.length} 个项目（挂载路径 ${data.docker_root}）`;
+      $('btnMigrate').disabled = projects.length === 0;
+      setConn(`已扫描挂载路径 ✓（${projects.length} 个项目）`, 'ok');
+    } else {
+      const body = {
+        host: $('host').value.trim(),
+        port: parseInt($('port').value) || 22,
+        username: $('username').value.trim(),
+        password: $('password').value,
+        // 「拉模式」：扫描远端（源 NAS）的项目
+        // 「推模式」：扫描本机（源 NAS）的项目，然后连接到远端（目标 NAS）验证 ssh 可达
+        scan_local: (mode === 'push'),
+        local_docker_root: $('localRoot').value.trim(),
+        remote_docker_root: $('remoteRoot').value.trim(),
+      };
+      if (!body.host) { setConn('请填写对端主机 IP', 'err'); $('btnConnect').disabled=false; return; }
+      const r = await fetch('/api/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+      const data = await r.json();
+      if (!r.ok) { setConn('连接失败：' + (data.detail||''), 'err'); $('btnConnect').disabled=false; return; }
+      setConn(mode === 'pull' ? '已连接源 NAS ✓' : '已连接目标 NAS + 扫描本机 ✓', 'ok');
+      await loadProjects();
+    }
   } catch (e) {
     setConn('连接失败：' + e, 'err');
   } finally {
@@ -326,7 +389,7 @@ async function migrate() {
   const sel = selectedProjects();
   if (!sel.length) { setMig('请至少选择一个项目', 'err'); return; }
   const body = {
-    direction: mode,           // pull | push
+    direction: mode,           // pull | push | local
     local_docker_root: $('localRoot').value.trim(),
     remote_docker_root: $('remoteRoot').value.trim(),
     projects: sel.map(p => ({name:p.name, remote_path:p.remote_path, local_path:p.local_path, compose_file:p.compose_file, size:p.size})),
@@ -334,6 +397,7 @@ async function migrate() {
     start_containers: $('startContainers').checked,
     source_prefix: $('sourcePrefix').value.trim(),
     target_prefix: $('targetPrefix').value.trim(),
+    source_docker_data: (mode === 'local') ? $('sourceDockerData').value.trim() : '',
   };
   if (!!body.source_prefix !== !!body.target_prefix) {
     setMig('路径前缀需成对填写（都填或都空）', 'err'); return;
@@ -345,7 +409,7 @@ async function migrate() {
     const r = await fetch('/api/migrate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     const data = await r.json();
     if (!r.ok) { setMig('提交失败：' + (data.detail||''), 'err'); $('btnMigrate').disabled=false; return; }
-    setMig(mode === 'pull' ? '拉取迁移中…' : '推送迁移中…', 'muted');
+    setMig(mode === 'pull' ? '拉取迁移中…' : (mode === 'push' ? '推送迁移中…' : '本地映射迁移中…'), 'muted');
     streamLog(data.task_id);
   } catch (e) {
     setMig('提交失败：' + e, 'err');

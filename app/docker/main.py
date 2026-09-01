@@ -1,7 +1,9 @@
-"""飞牛 Docker 迁移工具后端（通用版：拉模式 / 推模式）。
+"""飞牛 Docker 迁移工具后端（通用版：拉模式 / 推模式 / 本地映射模式）。
 
 - 拉模式（pull）：本应用部署在「目标 NAS」，SSH 连接源 NAS 扫描并拉取。
 - 推模式（push）：本应用部署在「源 NAS」，扫描本机项目并推送到对端。
+- 本地映射模式（local）：源 NAS 硬盘阵列已物理挂载到本机，直接扫描挂载点上的项目，
+  无需 SSH / rsync 网络传输，仅拷贝 compose + .env 到 staging 后在本地 build/pull/up。
 """
 import os
 import json
@@ -61,7 +63,7 @@ class ProjectSpec(BaseModel):
 
 
 class MigrateRequest(BaseModel):
-    direction: str = "pull"             # 'pull' | 'push'
+    direction: str = "pull"             # 'pull' | 'push' | 'local'
     local_docker_root: str = "/vol1/1000/docker"
     remote_docker_root: str = "/vol1/1000/docker"
     projects: list[ProjectSpec]
@@ -71,6 +73,9 @@ class MigrateRequest(BaseModel):
     # 把 compose 里以 source_prefix 开头的 bind mount 路径改写到 target_prefix
     source_prefix: str = ""
     target_prefix: str = ""
+    # 本地映射模式专用：源 NAS 的 docker data-root 在本机上的路径
+    # （如 /mnt/oldnas/var/lib/docker，用于 named volume 数据复制）
+    source_docker_data: str = ""
 
 
 # ---------------- 路由 ----------------
@@ -134,14 +139,39 @@ async def list_projects():
     return {"projects": projects, "docker_root": root, "mode": state["mode"]}
 
 
+# ---------------- 本地映射模式：扫描挂载点（无需 SSH） ----------------
+@app.get("/api/scan_local")
+async def scan_local(root: str = ""):
+    """本地映射模式：扫描源 NAS 硬盘挂载到本机的路径下的 compose 项目。
+
+    不需要 SSH 连接，直接用 list_local_projects 扫描本机路径。
+    返回的 projects 字段用 local_path（与推模式对齐），migrator._run_local 也读 local_path。
+    """
+    root = (root or "").strip()
+    if not root:
+        raise HTTPException(status_code=400, detail="请填写源 NAS 挂载路径")
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail=f"路径不存在或不可访问：{root}")
+    try:
+        projects = SSHClient.list_local_projects(root)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"扫描失败：{e}")
+    # 记录到 state，便于 /api/migrate 校验（local 模式 remote 可为 None）
+    state["mode"] = "local"
+    state["scan_root"] = root
+    state["remote"] = None
+    return {"projects": projects, "docker_root": root, "mode": "local"}
+
+
 @app.post("/api/migrate")
 async def migrate(req: MigrateRequest):
-    if not state["remote"]:
-        raise HTTPException(status_code=400, detail="请先连接对端 NAS")
+    if req.direction not in ("pull", "push", "local"):
+        raise HTTPException(status_code=400, detail="direction 必须是 pull / push / local")
     if not req.projects:
         raise HTTPException(status_code=400, detail="未选择任何项目")
-    if req.direction not in ("pull", "push"):
-        raise HTTPException(status_code=400, detail="direction 必须是 pull 或 push")
+    # local 模式不需要 SSH，其余模式需要已连接对端
+    if req.direction != "local" and not state["remote"]:
+        raise HTTPException(status_code=400, detail="请先连接对端 NAS")
 
     import uuid
     task_id = uuid.uuid4().hex
@@ -161,6 +191,7 @@ async def migrate(req: MigrateRequest):
             start_containers=req.start_containers,
             source_prefix=req.source_prefix,
             target_prefix=req.target_prefix,
+            source_docker_data=req.source_docker_data,
         )
     )
 

@@ -1,10 +1,10 @@
 appname               = dockermigrator
-version               = 1.2.0
+version               = 1.3.0
 display_name          = Docker 迁移工具
-desc                  = 通过 WebUI 在两台飞牛 NAS 之间迁移 Docker 项目（compose 配置 + 数据 + 外部 bind mount）。本应用可部署在源 NAS（推送模式）或目标 NAS（拉取模式），按向导选择方向即可。
+desc                  = 通过 WebUI 在两台飞牛 NAS 之间迁移 Docker 项目（compose 配置 + 数据 + 外部 bind mount）。本应用可部署在源 NAS（推送模式）或目标 NAS（拉取模式），按向导选择方向即可；另支持本地映射模式——当源 NAS 硬盘阵列已挂载到本机时，零网络传输直接迁移。
 source                = thirdparty
 maintainer            = DIY
 distributor           = DIY
 desktop_uidir         = ui
 desktop_applaunchname = dockermigrator.main
-checksum              = e813717a17eed51cf9d695433ceb4c72
+checksum              = 4c12b25a1fedccef7207cb09b9ac9687

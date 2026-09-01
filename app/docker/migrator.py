@@ -521,11 +521,58 @@ class Migrator:
                                    label=f"远端 docker network create {net_name}")
 
     # ==========================================================================
+    # 本地 rsync（无 SSH，用于 local 模式 named volume 数据复制）
+    # ==========================================================================
+    async def _rsync_local(self, task_id, src, dst, label=None):
+        """本机到本机的 rsync（无 SSH）。"""
+        parent = os.path.dirname(dst.rstrip("/"))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.makedirs(dst, exist_ok=True)
+        src = src if src.endswith("/") else src + "/"
+        dst = dst if dst.endswith("/") else dst + "/"
+        cmd = ["rsync", "-avX", "--numeric-ids", src, dst]
+        await self._run_cmd(task_id, cmd, label=label)
+
+    # ==========================================================================
+    # build context 改写（local 模式：相对路径 → 绝对路径指向挂载点项目目录）
+    # ==========================================================================
+    @staticmethod
+    def _rewrite_build_context(compose_path, project_dir):
+        """将 compose 中相对路径的 build context 改写为绝对路径。
+
+        local 模式下 staging 只拷贝了 compose 文件，build context（如 '.'/'./subdir'）
+        需改为指向挂载点上的原始项目目录，否则 compose build 找不到 Dockerfile。
+        """
+        with open(compose_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            return
+        changed = False
+        for svc in (data.get("services") or {}).values():
+            build = svc.get("build")
+            if not build:
+                continue
+            if isinstance(build, str):
+                if not os.path.isabs(build):
+                    svc["build"] = os.path.normpath(os.path.join(project_dir, build))
+                    changed = True
+            elif isinstance(build, dict):
+                ctx = build.get("context", ".")
+                if not os.path.isabs(ctx):
+                    build["context"] = os.path.normpath(os.path.join(project_dir, ctx))
+                    changed = True
+        if changed:
+            with open(compose_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False,
+                               default_flow_style=False)
+
+    # ==========================================================================
     # 统一入口
     # ==========================================================================
     async def run(self, task_id, direction, remote, local_docker_root, remote_docker_root,
                   projects, pull_images=True, start_containers=True,
-                  source_prefix="", target_prefix=""):
+                  source_prefix="", target_prefix="", source_docker_data=""):
         task = self.tasks[task_id]
         task["status"] = "running"
 
@@ -536,11 +583,17 @@ class Migrator:
                 await self._run_pull(task_id, remote, local_docker_root, projects,
                                      pull_images, start_containers,
                                      source_prefix, target_prefix, prefix_active)
-            else:
+            elif direction == "push":
                 self._log(task_id, f"[推模式] 开始迁移 {len(projects)} 个项目（从本机 → 目标 NAS）")
                 await self._run_push(task_id, remote, local_docker_root, remote_docker_root, projects,
                                      pull_images, start_containers,
                                      source_prefix, target_prefix, prefix_active)
+            else:
+                self._log(task_id, f"[本地映射模式] 开始迁移 {len(projects)} 个项目（源 NAS 硬盘已挂载到本机）")
+                await self._run_local(task_id, local_docker_root, projects,
+                                     pull_images, start_containers,
+                                     source_prefix, target_prefix, prefix_active,
+                                     source_docker_data)
 
             task["status"] = "done"
             self._log(task_id, "\n===== 全部迁移完成 =====")
@@ -876,6 +929,149 @@ class Migrator:
                 if start_containers:
                     await self._run_remote_cmd(task_id, remote, compose_ctx + ["up", "-d"],
                                                label=f"远端 compose up {name}")
+
+                self._log(task_id, f"✅ 项目 {name} 完成")
+        finally:
+            shutil.rmtree(tmp_workdir, ignore_errors=True)
+
+    # ==========================================================================
+    # 本地映射模式 — 源 NAS 硬盘已挂载到本机（零数据传输）
+    # ==========================================================================
+    async def _run_local(self, task_id, local_root, projects,
+                        pull_images, start_containers,
+                        source_prefix, target_prefix, prefix_active,
+                        source_docker_data=""):
+        """源 NAS 存储已物理挂载到本机，数据直接可访问，无需 SSH/rsync 传输。
+
+        source_prefix      = 源 NAS 上的原始路径前缀（如 /vol1/1000）
+        target_prefix      = 在本机上的挂载路径前缀（如 /mnt/oldnas/vol1/1000 或 /vol1/1000）
+        source_docker_data = 源 NAS 的 docker data-root 在本机上的路径
+                             （如 /mnt/oldnas/var/lib/docker，用于 named volume 数据复制）
+        """
+        if prefix_active:
+            self._log(task_id, f"路径前缀映射：{source_prefix} -> {target_prefix}")
+        else:
+            self._log(task_id,
+                      "路径前缀未映射：compose 中 bind 路径将原样使用（要求挂载路径与源 NAS 一致）")
+
+        tmp_workdir = tempfile.mkdtemp(prefix="miglocal_")
+        self._log(task_id, f"（临时 staging 目录：{tmp_workdir}）")
+        try:
+            for idx, proj in enumerate(projects, 1):
+                name = proj["name"]
+                source_path = proj.get("local_path") or proj.get("remote_path") or ""
+                if not source_path or not os.path.isdir(source_path):
+                    self._log(task_id, f"跳过 {name}：源路径不存在 {source_path}", "stderr")
+                    continue
+                compose_name = proj.get("compose_file", "docker-compose.yml")
+
+                self._log(task_id, f"\n{'='*10} [{idx}/{len(projects)}] {name} {'='*10}")
+                self._log(task_id, f"源路径（挂载点）：{source_path}")
+
+                # ---- 1) 找 compose ----
+                compose_src, compose_name = self._find_compose_file(source_path, compose_name)
+                if not compose_src:
+                    self._log(task_id, f"⚠️ 未找到 compose 文件，跳过 {name}", "stderr")
+                    continue
+
+                # ---- 2) staging：只拷贝 compose + .env（不拷贝数据，数据在挂载点直接可用）----
+                staging_dir = os.path.join(tmp_workdir, name)
+                os.makedirs(staging_dir, exist_ok=True)
+                staging_compose = os.path.join(staging_dir, compose_name)
+                shutil.copy2(compose_src, staging_compose)
+                env_src = os.path.join(source_path, ".env")
+                if os.path.exists(env_src):
+                    shutil.copy2(env_src, os.path.join(staging_dir, ".env"))
+                self._log(task_id, "  已拷贝 compose + .env 到 staging（不拷贝数据，数据在挂载点直接可用）")
+
+                # ---- 3) 解析 compose ----
+                try:
+                    parsed = self._parse_compose(staging_compose)
+                except Exception as e:
+                    self._log(task_id, f"警告：解析 compose 失败: {e}", "stderr")
+                    parsed = {"binds": [], "named_volumes": [], "volume_defs": {},
+                              "network_defs": {}, "has_build": False, "build_contexts": set()}
+
+                binds = parsed["binds"]
+                named_vols = parsed["named_volumes"]
+                volume_defs = parsed["volume_defs"]
+                network_defs = parsed["network_defs"]
+                has_build = parsed["has_build"]
+                build_contexts = parsed["build_contexts"]
+
+                if build_contexts:
+                    self._log(task_id, f"  发现 build 指令，contexts: {sorted(build_contexts)}")
+
+                # ---- 4) 重写 staging compose ----
+                # a. bind 路径前缀映射
+                if prefix_active:
+                    try:
+                        changed = self._rewrite_compose(staging_compose, source_prefix, target_prefix)
+                        if changed:
+                            self._log(task_id, "  已重写 bind 路径前缀")
+                    except Exception as e:
+                        self._log(task_id, f"警告：重写 compose 失败: {e}", "stderr")
+                # b. build context 改为绝对路径（指向挂载点上的项目目录）
+                try:
+                    self._rewrite_build_context(staging_compose, source_path)
+                except Exception as e:
+                    self._log(task_id, f"警告：重写 build context 失败: {e}", "stderr")
+
+                # ---- 5) named volumes ----
+                vol_names = set(vn for vn, _ in named_vols)
+                for vn in vol_names:
+                    vdef = volume_defs.get(vn, {"external": False})
+                    if vdef.get("external"):
+                        self._log(task_id, f"  volume {vn} 声明为 external，跳过")
+                        continue
+                    self._log(task_id, f"  处理 named volume: {vn}")
+                    try:
+                        local_mp = await self._ensure_local_volume(task_id, vn, vdef)
+                        if not local_mp:
+                            self._log(task_id, f"⚠️ 本机 create volume {vn} 失败", "stderr")
+                            continue
+                        # 尝试从源 NAS docker data-root 复制数据
+                        if source_docker_data:
+                            src_vol_data = os.path.join(source_docker_data, "volumes", vn, "_data")
+                            if os.path.isdir(src_vol_data):
+                                self._log(task_id, f"    从 {src_vol_data} 复制 volume 数据到 {local_mp}")
+                                await self._rsync_local(task_id, src_vol_data, local_mp,
+                                                       label=f"rsync volume {vn} 数据（本地复制）")
+                            else:
+                                self._log(task_id,
+                                          f"    源 docker data-root 中未找到 volume {vn} 的数据（{src_vol_data} 不存在），创建空 volume",
+                                          "stderr")
+                        else:
+                            self._log(task_id,
+                                      f"    未指定源 docker data-root 路径，volume {vn} 创建为空"
+                                      f"（如需复制数据请在高级选项中填写源 docker data-root 路径）",
+                                      "stderr")
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ named volume {vn} 处理失败: {e}（继续）", "stderr")
+
+                # ---- 6) custom networks ----
+                for net_name, ndef in network_defs.items():
+                    try:
+                        await self._ensure_local_network(task_id, net_name, ndef)
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ network {net_name} 创建失败: {e}（继续）", "stderr")
+
+                # ---- 7) compose build / pull / up ----
+                compose_ctx = ["docker", "compose", "-f", staging_compose, "-p", name]
+                if has_build:
+                    self._log(task_id, "  检测到 build 指令，先 compose build")
+                    try:
+                        await self._run_cmd(task_id, compose_ctx + ["build"],
+                                            label=f"docker compose build {name}")
+                    except Exception as e:
+                        self._log(task_id, f"⚠️ compose build 失败: {e}（继续尝试 up）", "stderr")
+                if pull_images and not has_build:
+                    await self._run_cmd(task_id, compose_ctx + ["pull"],
+                                        label=f"docker compose pull {name}",
+                                        warn_only=True)
+                if start_containers:
+                    await self._run_cmd(task_id, compose_ctx + ["up", "-d"],
+                                        label=f"docker compose up {name}")
 
                 self._log(task_id, f"✅ 项目 {name} 完成")
         finally:
