@@ -41,8 +41,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY . .
+RUN chmod +x /app/entrypoint.sh
+
+# 显式以 root 运行，规避 UID/GID 不一致带来的挂载点 Permission denied。
+# 上层若以 user 覆盖则以覆盖者为准，但 entrypoint 诊断会提示当前身份。
+USER root
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["/app/entrypoint.sh"]

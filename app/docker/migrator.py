@@ -82,6 +82,41 @@ class Migrator:
          "💡 修复建议：目标 NAS 磁盘空间不足。docker system prune -a 清理或换大容量卷。"),
     ]
 
+    # 权限类错误 → 中文修复建议（本地映射模式 rsync/compose 读取挂载点文件）
+    PERMISSION_ERROR_HINTS = [
+        (["Permission denied", "permission denied", "EACCES", "权限不够"],
+         "💡 权限修复建议（本地映射模式）：常见原因 ① NFS/USB 挂载时启用了 root_squash / all_squash "
+         "将容器内 uid=0 映射成 nobody，源目录属主又不是 nobody；② 源目录 POSIX 位只有属主可读；"
+         "③ mount 参数是 ro 而挂载点恰好需要遍历写入。排查：在飞牛主机 `ls -ld <挂载路径>` + "
+         "`id`，对比容器日志启动诊断的 uid/gid 是否匹配；NFS 改 /etc/exports 加 no_root_squash，"
+         "或挂载参数 anonuid=0,anongid=0；或对整个挂载点递归 chmod o+rX 给『其他用户』可读。"),
+        (["No such file or directory", "does not exist", "不存在"],
+         "💡 路径修复建议（本地映射模式）：源目录/文件不存在 —— 大概率是「挂载点没有透传到容器内」。"
+         "请检查 compose.yaml volumes 是否包含该路径，或重新安装向导中「源 NAS 挂载根路径」是否填写；"
+         "容器日志启动诊断中会输出当前容器可见的挂载卷，与用户填写路径对比即可定位。"),
+        (["Read-only file system", "EROFS", "read-only"],
+         "💡 只读文件系统修复：源数据读取为 ro 没问题；但 named volume 复制 / compose staging 写入时若报 "
+         "EROFS，请确认本机 LOCAL_DOCKER_ROOT 所在挂载是 rw，以及 docker volumes 目录 (默认 "
+         "/var/lib/docker/volumes) 是 rw，飞牛 compose 中目标卷需写 ':rw'。"),
+    ]
+
+    @classmethod
+    def _diagnose_permission_error(cls, all_lines):
+        """rsync / compose 出错时匹配权限类修复建议。"""
+        if not all_lines:
+            return None
+        import re
+        blob = "\n".join(all_lines).lower()
+        for kws, hint in cls.PERMISSION_ERROR_HINTS:
+            hit = False
+            for kw in kws:
+                if re.search(kw.lower(), blob):
+                    hit = True
+                    break
+            if hit:
+                return hint
+        return None
+
     @classmethod
     def _diagnose_docker_error(cls, all_lines):
         if not all_lines:
@@ -148,14 +183,22 @@ class Migrator:
             if warn_only:
                 self._log(task_id, f"警告：exit={rc}（warn_only，继续）", "stderr")
                 return None
+            hinted = False
             if cmd and (cmd[0].endswith("docker") or "docker" in cmd[0]):
                 hint = self._diagnose_docker_error(all_lines)
                 if hint:
                     self._log(task_id, hint, "stderr")
-                else:
-                    self._log(task_id,
-                              "💡 通用排查：① 对应 NAS docker info 正常吗？② 镜像/tag 存在吗？③ 磁盘(df -h)和网络？",
-                              "stderr")
+                    hinted = True
+            # 权限类修复建议（rsync/cp/ls 等所有本地命令）
+            if not hinted:
+                perm_hint = self._diagnose_permission_error(all_lines)
+                if perm_hint:
+                    self._log(task_id, perm_hint, "stderr")
+                    hinted = True
+            if not hinted:
+                self._log(task_id,
+                          "💡 通用排查：① docker info 正常吗？② 路径/镜像/tag 存在吗？③ 磁盘(df -h)和权限(ls -ld)？",
+                          "stderr")
             raise RuntimeError(f"命令失败 (exit={rc})")
         return "\n".join(all_lines)
 
@@ -948,11 +991,56 @@ class Migrator:
         source_docker_data = 源 NAS 的 docker data-root 在本机上的路径
                              （如 /mnt/oldnas/var/lib/docker，用于 named volume 数据复制）
         """
+        # ---- 0) 权限/可达性诊断 ----
+        try:
+            my_uid, my_gid = os.getuid(), os.getgid()
+            self._log(task_id,
+                      f"ℹ️ 当前进程 uid={my_uid} gid={my_gid}（容器应以 root 运行读取挂载点）")
+        except Exception:
+            pass
+        checked_dirs = set()
+        for proj in projects:
+            p = proj.get("local_path") or proj.get("remote_path")
+            if p:
+                checked_dirs.add(p)
+        if source_docker_data:
+            checked_dirs.add(source_docker_data)
+        for d in sorted(checked_dirs):
+            if not os.path.exists(d):
+                self._log(task_id,
+                          f"❌ 路径不存在：{d}（挂载点是否透传到了容器？见容器日志启动诊断章节）",
+                          "stderr")
+                continue
+            try:
+                st = os.stat(d)
+                mode_oct = oct(st.st_mode & 0o777)
+                self._log(task_id,
+                          f"ℹ️  {d}: uid={st.st_uid} gid={st.st_gid} mode={mode_oct} "
+                          f"r_ok={os.access(d, os.R_OK)} x_ok={os.access(d, os.X_OK)}")
+                if not os.access(d, os.R_OK) or not os.access(d, os.X_OK):
+                    self._log(task_id,
+                              "⚠️ 目录缺 r 或 x 位 → 读 compose 或递归复制 named volume 将失败，"
+                              "请在主机侧 `chmod o+rX` 或以 root 挂载，"
+                              "NFS 请在 /etc/exports 加 no_root_squash",
+                              "stderr")
+            except PermissionError as e:
+                self._log(task_id, f"❌ stat({d}) 权限失败: {e}", "stderr")
+            except OSError as e:
+                self._log(task_id, f"❌ stat({d}) 失败: {e}", "stderr")
+
         if prefix_active:
             self._log(task_id, f"路径前缀映射：{source_prefix} -> {target_prefix}")
         else:
             self._log(task_id,
                       "路径前缀未映射：compose 中 bind 路径将原样使用（要求挂载路径与源 NAS 一致）")
+        if source_docker_data:
+            self._log(task_id,
+                      f"源 docker data-root：{source_docker_data}（named volume 数据将从这里复制到本机 docker volumes）")
+        else:
+            self._log(task_id,
+                      "⚠️ 未指定源 docker data-root，named volume 创建为空（如需复制数据请填源 NAS 的 "
+                      "/var/lib/docker 在本机挂载点上的路径）",
+                      "stderr")
 
         tmp_workdir = tempfile.mkdtemp(prefix="miglocal_")
         self._log(task_id, f"（临时 staging 目录：{tmp_workdir}）")

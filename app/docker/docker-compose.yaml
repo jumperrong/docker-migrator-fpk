@@ -5,16 +5,25 @@ services:
     build: .
     container_name: dockermigrator
     restart: unless-stopped
+    # 显式以 root 运行，避免容器内 UID/GID 与 NAS 用户目录不匹配时出现 Permission denied。
+    # 飞牛 privilege 的 run-as=package 仅控制包目录权限，容器进程仍以 Docker 为准。
+    user: "0:0"
     networks:
       - trim-default
     ports:
       - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${wizard_docker_root:-/vol1/1000/docker}:${wizard_docker_root:-/vol1/1000/docker}
+      # 目标 Docker 根目录（安装向导注入）：迁移项目落到此目录，并在此目录启动 compose
+      - ${wizard_docker_root:-/vol1/1000/docker}:${wizard_docker_root:-/vol1/1000/docker}:rw
+      # 本地映射模式：若安装时填写了「源 NAS 挂载根路径」，以只读方式把主机挂载点透传到容器同路径
+      # ⚠️ 注意：若挂载根路径为空，这条不会生效；安装后需要挂载其他路径时，可在飞牛停止应用 →
+      #    编辑 compose.yaml 的 volumes，或使用飞牛的「目录挂载」功能添加后再启动。
+      - ${wizard_source_mount:-/mnt/oldnas}:${wizard_source_mount:-/mnt/oldnas}:ro
     environment:
       - TZ=Asia/Shanghai
       - LOCAL_DOCKER_ROOT=${wizard_docker_root:-/vol1/1000/docker}
+      - SOURCE_MOUNT=${wizard_source_mount:-}
 
 networks:
   trim-default:

@@ -140,27 +140,156 @@ async def list_projects():
 
 
 # ---------------- 本地映射模式：扫描挂载点（无需 SSH） ----------------
+# 权限错误 → 中文修复建议（覆盖容器挂载/uid-gid/NFS/目录权限）
+_PERMISSION_HINTS = [
+    ("容器内不可见挂载点",
+     "💡 修复建议：路径在容器里不存在 → 该挂载路径未透传到 Docker 容器。"
+     "在飞牛「停止应用」后编辑 docker-compose.yaml 的 volumes，"
+     "或重新安装/配置挂载向导字段「源 NAS 挂载根路径」，然后重启应用。"
+     "可在容器日志「启动诊断」章节查看已挂载清单。"),
+    ("EACCES", "Permission denied", "permission denied"),
+    ("💡 修复建议：Permission denied（EACCES）常见原因：① 源 NAS 硬盘挂载在本机使用了 UID/GID 映射（NFS all_squash / root_squash）"
+     "导致 root(容器内 uid=0) 无权读；② ext4/btrfs 挂载目录的 POSIX 权限不给 root 可读；"
+     "建议：① 在飞牛主机侧执行 `ls -ld 路径` + `id`，对比容器日志启动诊断的 uid/gid；"
+     "② NFS 改 /etc/exports 加 no_root_squash 或挂载时 anonuid=0; ③ U 盘/移动硬盘确保挂载时给用户/组可读权限。"),
+    ("EROFS", "read-only", "Read-only"),
+    ("💡 修复建议：文件系统只读（EROFS）。检查 mount 是否带 ro；USB 硬盘写保护开关；NTFS 可能只读需要 ntfs-3g。"),
+    ("ENOENT", "No such file", "not found"),
+    ("💡 修复建议：路径不存在（ENOENT）——容器内路径是否已随挂载点透传？「启动诊断」中对比已挂载卷与填写路径。"),
+]
+
+
+def _diagnose_permission_error(err_str: str):
+    """从错误字符串匹配权限类提示，返回首条命中的修复建议。"""
+    if not err_str:
+        return None
+    e = err_str.lower()
+    # 第一行是症状关键词，紧接下一行是修复建议；按顺序两条为一组
+    i = 0
+    while i + 1 < len(_PERMISSION_HINTS):
+        kws = _PERMISSION_HINTS[i]
+        suggestion = _PERMISSION_HINTS[i + 1]
+        if isinstance(kws, str):
+            kws = [kws]
+        for kw in kws:
+            if kw.lower() in e:
+                return suggestion
+        i += 2
+    return None
+
+
+def _probe_local_path(root: str) -> str:
+    """针对本地映射模式做权限探测，返回可读空字符串或拼接好的中文诊断信息。
+
+    探测项：
+      1) 路径存在？
+      2) 目录可读 + 可遍历（r+x）？
+      3) 能列出目录内容（find 会报错 Permission denied 吗）？
+      4) 随机挑一个 compose 文件能读吗？
+      5) uid/gid 与源目录不一致的风险提示
+    """
+    import subprocess
+    import shlex
+    msgs = []
+    # 1) 路径存在
+    if not os.path.exists(root):
+        return (
+            f"❌ 路径不存在：{root}\n"
+            + _PERMISSION_HINTS[7] if len(_PERMISSION_HINTS) > 7 else ""
+        )
+    if not os.path.isdir(root):
+        return f"❌ 路径存在但不是目录：{root}"
+    # 2) r+x
+    if not os.access(root, os.R_OK):
+        msgs.append("❌ 目录不可读（R_OK 失败），可能是 POSIX 权限或 ACL 限制")
+    if not os.access(root, os.X_OK):
+        msgs.append("❌ 目录不可遍历（X_OK 失败，无法 cd 进入子目录）")
+    # 3) 能否列出第一层（用 os.listdir，失败会抛 PermissionError）
+    try:
+        items = os.listdir(root)
+        if len(items) == 0:
+            msgs.append("⚠️ 路径可读但是空目录，请确认挂载路径是否正确")
+    except PermissionError as e:
+        msgs.append(f"❌ 列出目录内容失败（PermissionError）: {e}")
+    except OSError as e:
+        msgs.append(f"❌ 列出目录内容失败: {e}")
+    # 4) 试 find -maxdepth 4，看是否有 EACCES 子目录
+    try:
+        out = subprocess.check_output(
+            f"find {shlex.quote(root)} -maxdepth 4 "
+            r"\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
+            r"-o -name 'compose.yml' -o -name 'compose.yaml' \) "
+            "2>&1 | head -20",
+            shell=True, text=True, stderr=subprocess.STDOUT,
+        )
+        if "Permission denied" in out or "权限不够" in out:
+            msgs.append("⚠️ find 扫描过程中出现子目录 Permission denied，可能某些项目目录将被跳过")
+    except subprocess.CalledProcessError as e:
+        msgs.append(f"❌ find 扫描返回错误 exit={e.returncode}: {e.output[:400]}")
+    # 5) 读取 uid/gid 样本，判断与容器内 root 是否一致
+    try:
+        st = os.stat(root)
+        uid, gid = st.st_uid, st.st_gid
+        import pwd, grp
+        try:
+            owner = pwd.getpwuid(uid).pw_name
+        except Exception:
+            owner = f"uid={uid}"
+        try:
+            group = grp.getgrgid(gid).gr_name
+        except Exception:
+            group = f"gid={gid}"
+        mode_bits = oct(st.st_mode & 0o777)
+        msgs.append(f"ℹ️ 目录属主: {owner}:{group} (uid={uid},gid={gid})，权限位 {mode_bits}，"
+                    f"当前容器进程 uid={os.getuid()} gid={os.getgid()}")
+        if os.getuid() != 0 and os.getuid() != uid:
+            msgs.append("⚠️ 容器进程非 root 且与目录属主 uid 不同，可能无法读取——建议 compose.yaml 配置 user: '0:0'")
+    except Exception:
+        pass
+
+    if msgs:
+        return "\n".join(msgs)
+    return ""
+
+
 @app.get("/api/scan_local")
 async def scan_local(root: str = ""):
     """本地映射模式：扫描源 NAS 硬盘挂载到本机的路径下的 compose 项目。
 
+    扫描前先做权限探测；如有权限风险会给出中文修复建议。
     不需要 SSH 连接，直接用 list_local_projects 扫描本机路径。
-    返回的 projects 字段用 local_path（与推模式对齐），migrator._run_local 也读 local_path。
     """
     root = (root or "").strip()
     if not root:
         raise HTTPException(status_code=400, detail="请填写源 NAS 挂载路径")
-    if not os.path.isdir(root):
-        raise HTTPException(status_code=400, detail=f"路径不存在或不可访问：{root}")
+    # 权限探测
+    diag = _probe_local_path(root)
+    if diag and any(l.startswith("❌") for l in diag.splitlines()):
+        hint = _diagnose_permission_error(diag)
+        msg = "容器内无法访问源 NAS 挂载点，请按以下说明修复：\n\n" + diag
+        if hint:
+            msg += "\n\n" + hint
+        raise HTTPException(status_code=400, detail=msg)
     try:
         projects = SSHClient.list_local_projects(root)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"扫描失败：{e}")
+        err_str = str(e)
+        hint = _diagnose_permission_error(err_str)
+        msg = f"扫描失败：{err_str}"
+        if diag:
+            msg += "\n\n权限探测：\n" + diag
+        if hint:
+            msg += "\n\n" + hint
+        raise HTTPException(status_code=500, detail=msg)
     # 记录到 state，便于 /api/migrate 校验（local 模式 remote 可为 None）
     state["mode"] = "local"
     state["scan_root"] = root
     state["remote"] = None
-    return {"projects": projects, "docker_root": root, "mode": "local"}
+    result = {"projects": projects, "docker_root": root, "mode": "local"}
+    if diag:
+        # 有⚠️类提示但无❌，作为警告附加返回（UI 可在控制台显示）
+        result["warnings"] = diag
+    return result
 
 
 @app.post("/api/migrate")

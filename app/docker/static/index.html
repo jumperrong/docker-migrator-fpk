@@ -157,6 +157,8 @@
   <!-- 2. 选择项目 -->
   <section class="card">
     <h2>2. 选择迁移项目</h2>
+    <div id="scanWarn" style="display:none;margin:0 0 12px;padding:10px 14px;border:1px solid #5a4a1a;
+         background:#2a2410;color:#ffd479;border-radius:8px;font-size:12px;white-space:pre-wrap"></div>
     <div class="toolbar">
       <button class="ghost" onclick="selectAll(true)">全选</button>
       <button class="ghost" onclick="selectAll(false)">全不选</button>
@@ -304,6 +306,15 @@ async function connect() {
       renderProjects();
       $('scanInfo').textContent = `共 ${projects.length} 个项目（挂载路径 ${data.docker_root}）`;
       $('btnMigrate').disabled = projects.length === 0;
+      // 显示权限探测产生的警告（无❌的软警告）
+      const warnBox = $('scanWarn');
+      if (data.warnings) {
+        warnBox.style.display = '';
+        warnBox.textContent = '⚠️ 扫描阶段的权限/路径提示：\n' + data.warnings;
+      } else {
+        warnBox.style.display = 'none';
+        warnBox.textContent = '';
+      }
       setConn(`已扫描挂载路径 ✓（${projects.length} 个项目）`, 'ok');
     } else {
       const body = {

@@ -4,25 +4,43 @@
         "items": [
             {
                 "type": "tips",
-                "helpText": "本工具部署在<b>目标 NAS</b>上，安装时会构建镜像（仅 python:3.11-slim 基础镜像 + apt 系统包需联网，约 2-5 分钟；docker CLI 与 Python 依赖均已随包提供，无需访问 docker hub / PyPI）。装完后桌面出现「Docker 迁移工具」图标，点开即用 WebUI 连接源 NAS 拉取项目。"
+                "helpText": "本工具支持三种迁移方式：①<b>拉模式</b>（本应用部署在目标 NAS，SSH 连源 NAS 拉）；②<b>推模式</b>（本应用部署在源 NAS，SSH 连目标 NAS 推）；③<b>本地映射模式</b>（源 NAS 硬盘已挂载到本机，直接零网络传输）。安装后可在 WebUI 中切换使用。"
             },
             {
                 "type": "tips",
-                "helpText": "下方「目标 Docker 根目录」是迁移项目落地的位置。飞牛常见路径为 <code>/vol1/1000/docker</code>。容器会以同一路径挂载，保证迁移项目的相对目录映射正确。如不确定，保持默认即可，装好后在 WebUI 里也能改。"
-            },
-            {
-                "type": "tips",
-                "helpText": "注意：飞牛 fnOS 会以原 field 名（即 <code>wizard_docker_root</code>）作为环境变量名注入 cmd 脚本与 compose 进程，故 docker-compose.yaml 直接用 <code>${wizard_docker_root}</code> 读取。"
+                "helpText": "下方「目标 Docker 根目录」是迁移项目落地的位置，容器将以<b>同一路径</b>挂读写卷，保证迁移项目的 bind mount 路径相对映射正确。飞牛常见路径为 <code>/vol1/1000/docker</code>。如不确定，保持默认即可。"
             },
             {
                 "type": "text",
                 "field": "wizard_docker_root",
                 "label": "目标 Docker 根目录",
                 "initValue": "/vol1/1000/docker",
-                "description": "迁移过来的项目会放到这个目录下，并在此目录用 docker compose 启动。",
+                "description": "迁移过来的项目会放到这个目录下，并在此目录用 docker compose 启动容器。",
                 "rules": [
                     { "required": true, "message": "请填写目标 Docker 根目录" },
-                    { "pattern": "^/vol[0-9]+/.+", "message": "路径需以 /vol 开头，例如 /vol1/1000/docker" }
+                    { "pattern": "^/[A-Za-z0-9_.\\-][A-Za-z0-9_./\\-]*$", "message": "路径须为绝对路径，例如 /vol1/1000/docker" }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "<b>本地映射模式专用（选填）：</b>如果源 NAS 硬盘阵列已经通过 USB/eSATA/NFS 等方式挂载到了<b>本机</b>，请把挂载到本机的<b>根路径</b>填到下方。容器会以<b>只读方式</b>把该路径透传到容器内同路径，保证本地映射模式下扫描项目与读取数据。可以留空（只用 SSH 拉/推模式时无需填写）。"
+            },
+            {
+                "type": "tips",
+                "helpText": "举例子：源 NAS 原本项目在 <code>/vol1/1000/docker</code>，您把整个硬盘挂载到本机的 <code>/mnt/oldnas</code>，则本机完整路径为 <code>/mnt/oldnas/vol1/1000/docker</code>，此填 <code>/mnt/oldnas</code>（挂载点根路径），进入 WebUI 后在挂载路径里输入 <code>/mnt/oldnas/vol1/1000/docker</code>。"
+            },
+            {
+                "type": "tips",
+                "helpText": "⚠️ 权限提示：① 如出现 Permission denied，先检查 NAS 端该挂载目录对 <code>root</code> 或其他用户是否可读；② 应用启动后可在 Docker 容器日志中看到「启动诊断」，列出 uid/gid 和挂载点清单，用于快速定位。③ 安装后如需调整挂载点，停止应用后编辑 <code>docker-compose.yaml</code> volumes 再启动即可。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_source_mount",
+                "label": "源 NAS 挂载根路径（本地映射模式选填）",
+                "initValue": "",
+                "description": "源 NAS 硬盘在本机的挂载根路径，例如 /mnt/oldnas。不需要本地映射模式则留空。",
+                "rules": [
+                    { "pattern": "^$|^/[A-Za-z0-9_.\\-][A-Za-z0-9_./\\-]*$", "message": "若填写，必须是绝对路径，例如 /mnt/oldnas" }
                 ]
             }
         ]

@@ -1,13 +1,6 @@
 {
     "docker-project": {
-        "projects": [
-            {
-                "name": "dockermigrator",
-                "path": "docker"
-            }
-        ]
-    },
-    "data-share": {
-        "shares": []
+        "compose-file": "docker/docker-compose.yaml",
+        "project-name": "dockermigrator"
     }
 }
